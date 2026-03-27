@@ -567,21 +567,46 @@ def fetch_page_insights():
     if not FB_PAGE_ID:
         log.info("  No FB_PAGE_ID set, skipping")
         return []
-    page = Page(FB_PAGE_ID)
+
+    # Get Page Access Token from user token
+    import requests as req
+    try:
+        resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}",
+            params={"fields": "access_token", "access_token": FB_ACCESS_TOKEN}
+        ).json()
+        page_token = resp.get("access_token", FB_ACCESS_TOKEN)
+        log.info(f"  Got page access token: {'✅' if page_token != FB_ACCESS_TOKEN else '⚠️ using user token'}")
+    except Exception as e:
+        log.warning(f"  Could not get page token: {e}")
+        page_token = FB_ACCESS_TOKEN
+
+    # Only valid metrics that work with page token
     metrics = [
-        "page_impressions", "page_impressions_unique",
-        "page_impressions_paid", "page_impressions_organic",
-        "page_engaged_users", "page_post_engagements",
-        "page_views_total", "page_fans", "page_fan_adds", "page_fan_removes",
-        "page_video_views", "page_video_views_unique",
-        "page_actions_post_reactions_total",
-        "page_negative_feedback",
+        "page_impressions",
+        "page_impressions_unique",
+        "page_impressions_paid",
+        "page_impressions_organic",
+        "page_engaged_users",
+        "page_post_engagements",
+        "page_views_total",
+        "page_fans",
+        "page_fan_adds",
+        "page_fan_removes",
+        "page_video_views",
+        "page_video_views_unique",
     ]
     start, end = date_range()
     rows = []
-    # Request each metric individually to avoid API errors
+
+    # Use page access token for page insights
+    from facebook_business.api import FacebookAdsApi
+    original_api = FacebookAdsApi.get_default_api()
+    page_api = FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, page_token, api_version="v18.0")
+
     for metric in metrics:
         try:
+            page = Page(FB_PAGE_ID)
             for m in page.get_insights(params={
                 "metric": metric,
                 "period": "day",
@@ -600,6 +625,10 @@ def fetch_page_insights():
                     })
         except Exception as e:
             log.warning(f"  Page metric {metric} error: {e}")
+
+    # Restore original API
+    FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, FB_ACCESS_TOKEN, api_version="v18.0")
+    log.info(f"  Fetched {len(rows)} page insight rows")
     return rows
 
 def fetch_pixel_events(accounts):
