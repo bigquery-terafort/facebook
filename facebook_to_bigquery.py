@@ -1152,7 +1152,6 @@ def fetch_app_events(accounts):
                     AdsInsights.Field.date_start,
                     AdsInsights.Field.account_id,
                     AdsInsights.Field.actions,
-                    "promoted_object",
                 ],
                 params={
                     "level":          "account",
@@ -1162,15 +1161,13 @@ def fetch_app_events(accounts):
                 }
             )
             for i in insights:
-                promo = i.get("promoted_object") or {}
-                app_id = promo.get("application_id", "")
                 for action in i.get("actions", []):
                     action_type = action.get("action_type", "")
                     if "app" in action_type or "mobile" in action_type:
                         rows.append({
                             "date":         i.get("date_start"),
                             "account_id":   i.get("account_id"),
-                            "app_id":       app_id,
+                            "app_id":       "",
                             "event_name":   action_type,
                             "count":        safe_int(action.get("value")),
                             "unique_users": None,
@@ -1187,6 +1184,7 @@ def fetch_ad_creatives(accounts):
     log.info("Fetching Ad Creative Details...")
     from facebook_business.adobjects.adcreative import AdCreative
     rows = []
+    # Use minimal fields to avoid Facebook's data size limit
     fields = [
         AdCreative.Field.id,
         AdCreative.Field.name,
@@ -1197,27 +1195,23 @@ def fetch_ad_creatives(accounts):
         AdCreative.Field.thumbnail_url,
         AdCreative.Field.video_id,
         AdCreative.Field.link_url,
-        AdCreative.Field.effective_object_story_id,
-        AdCreative.Field.object_story_spec,
     ]
     for account in accounts:
         try:
-            for c in account.get_ad_creatives(fields=fields, params={"limit": 500}):
-                oss = c.get("object_story_spec") or {}
-                ld  = oss.get("link_data") or {}
-                vd  = oss.get("video_data") or {}
+            # Use small limit to avoid 500 errors
+            for c in account.get_ad_creatives(fields=fields, params={"limit": 50}):
                 rows.append({
                     "account_id":               account.get_id(),
                     "creative_id":              c.get("id"),
                     "name":                     c.get("name"),
-                    "title":                    c.get("title") or ld.get("name"),
-                    "body":                     c.get("body") or ld.get("message"),
-                    "call_to_action_type":      c.get("call_to_action_type") or (ld.get("call_to_action") or {}).get("type"),
-                    "image_url":                c.get("image_url") or vd.get("image_url"),
+                    "title":                    c.get("title"),
+                    "body":                     c.get("body"),
+                    "call_to_action_type":      c.get("call_to_action_type"),
+                    "image_url":                c.get("image_url"),
                     "thumbnail_url":            c.get("thumbnail_url"),
-                    "video_id":                 c.get("video_id") or vd.get("video_id"),
-                    "link_url":                 c.get("link_url") or ld.get("link"),
-                    "effective_object_story_id": c.get("effective_object_story_id"),
+                    "video_id":                 c.get("video_id"),
+                    "link_url":                 c.get("link_url"),
+                    "effective_object_story_id": None,
                     "_ingested_at":             now_ts(),
                 })
         except Exception as e:
@@ -1302,7 +1296,7 @@ def get_all_ad_accounts_including_inactive():
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(" Facebook → BigQuery COMPLETE sync")
+    log.info("🚀 Facebook → BigQuery COMPLETE sync")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days | Business: {FB_BUSINESS_ID}")
 
     # Use stable API version to avoid appsecret_proof issues
