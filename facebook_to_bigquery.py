@@ -18,7 +18,7 @@ Tables:
   10. pixel_events               — conversion events
 """
 
-import os, json, logging, time, hashlib
+import os, json, logging, time
 from datetime import datetime, timedelta
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.business import Business
@@ -628,18 +628,13 @@ def main():
     log.info("🚀 Facebook → BigQuery COMPLETE sync")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days | Business: {FB_BUSINESS_ID}")
 
-    # Generate appsecret_proof required by newer Facebook API versions
-    import hmac
-    appsecret_proof = hmac.new(
-        FB_APP_SECRET.encode("utf-8"),
-        FB_ACCESS_TOKEN.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    # Use stable API version to avoid appsecret_proof issues
+    os.environ["FACEBOOK_API_VERSION"] = "v18.0"
     FacebookAdsApi.init(
-        FB_APP_ID,
-        FB_APP_SECRET,
-        FB_ACCESS_TOKEN,
-        api_version="v18.0"  # stable version
+        app_id=FB_APP_ID,
+        app_secret=FB_APP_SECRET,
+        access_token=FB_ACCESS_TOKEN,
+        api_version="v18.0"
     )
 
     # Auto-discover all active ad accounts
