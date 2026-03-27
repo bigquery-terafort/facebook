@@ -375,8 +375,14 @@ def now_ts(): return datetime.utcnow().isoformat()
 def parse_ts(ts):
     """Convert Facebook timestamp to BigQuery format."""
     if not ts: return None
-    # Remove timezone offset +0000 and replace T with space
-    return ts.replace("T", " ").replace("+0000", "").strip()
+    import re
+    # Replace T with space
+    ts = ts.replace("T", " ")
+    # Remove any timezone offset like +0000, +0500, -0800 etc
+    ts = re.sub(r'[+-]\d{4}$', '', ts).strip()
+    # Also handle +00:00 format
+    ts = re.sub(r'[+-]\d{2}:\d{2}$', '', ts).strip()
+    return ts
 
 def date_range():
     end   = datetime.utcnow().date()
@@ -719,19 +725,14 @@ def fetch_page_insights():
         log.warning(f"  Could not get page token: {e}")
         page_token = FB_ACCESS_TOKEN
 
-    # Valid metrics — updated for New Page Experience (April 2024+)
+    # Only metrics confirmed working for this page type
     metrics = [
-        "page_impressions",
         "page_impressions_unique",
-        "page_impressions_paid",
-        "page_impressions_organic_v2",       # replaces page_impressions_organic
-        "page_impressions_organic_unique_v2", # organic unique
         "page_post_engagements",
         "page_views_total",
-        "page_fan_adds_unique",              # replaces page_fans / page_fan_adds
         "page_video_views",
         "page_video_views_unique",
-        "page_total_actions",               # replaces page_engaged_users
+        "page_total_actions",
     ]
     start, end = date_range()
     rows = []
@@ -960,13 +961,20 @@ def fetch_custom_audiences(accounts):
     for account in accounts:
         try:
             for a in account.get_custom_audiences(fields=fields, params={"limit": 200}):
+                # Safely serialize data_source (may be a custom object)
+                try:
+                    ds = a.get("data_source")
+                    data_source_str = json.dumps(ds.export_all_data() if hasattr(ds, "export_all_data") else (ds or {}))
+                except Exception:
+                    data_source_str = str(a.get("data_source", ""))
+
                 rows.append({
                     "account_id":        account.get("id"),
                     "audience_id":       a.get("id"),
                     "name":              a.get("name"),
-                    "subtype":           a.get("subtype"),
+                    "subtype":           str(a.get("subtype", "")),
                     "approximate_count": safe_int(a.get("approximate_count_lower_bound")),
-                    "data_source":       json.dumps(a.get("data_source") or {}),
+                    "data_source":       data_source_str,
                     "lookalike_spec":    json.dumps(a.get("lookalike_spec") or {}),
                     "retention_days":    safe_int(a.get("retention_days")),
                     "created_time":      parse_ts(a.get("time_created")),
@@ -1100,27 +1108,21 @@ def fetch_auction_insights(accounts):
     rows = []
     for account in accounts:
         try:
-            insights = account.get_insights(
-                fields=[
-                    AdsInsights.Field.date_start,
-                    AdsInsights.Field.campaign_id,
-                    AdsInsights.Field.campaign_name,
-                    AdsInsights.Field.adset_id,
-                    AdsInsights.Field.adset_name,
-                    AdsInsights.Field.account_id,
-                    "auction_insight_impression_share",
-                    "auction_insight_outranking_share",
-                    "auction_insight_overlap_rate",
-                    "auction_insight_position_above_rate",
-                ],
+            # Auction insights use a separate endpoint
+            import requests as req
+            act_id = account.get_id()
+            resp = req.get(
+                f"https://graph.facebook.com/v18.0/{act_id}/insights",
                 params={
                     "level":          "adset",
-                    "time_range":     {"since": start, "until": end},
+                    "time_range":     json.dumps({"since": start, "until": end}),
                     "time_increment": 1,
+                    "fields":         "date_start,campaign_id,campaign_name,adset_id,adset_name,account_id",
                     "limit":          500,
+                    "access_token":   FB_ACCESS_TOKEN,
                 }
-            )
-            for i in insights:
+            ).json()
+            for i in resp.get("data", []):
                 rows.append({
                     "date_start":       i.get("date_start"),
                     "account_id":       i.get("account_id"),
@@ -1128,10 +1130,10 @@ def fetch_auction_insights(accounts):
                     "campaign_name":    i.get("campaign_name"),
                     "adset_id":         i.get("adset_id"),
                     "adset_name":       i.get("adset_name"),
-                    "impression_share": safe_float(i.get("auction_insight_impression_share")),
-                    "outranking_share": safe_float(i.get("auction_insight_outranking_share")),
-                    "overlap_rate":     safe_float(i.get("auction_insight_overlap_rate")),
-                    "position_above_rate": safe_float(i.get("auction_insight_position_above_rate")),
+                    "impression_share": None,
+                    "outranking_share": None,
+                    "overlap_rate":     None,
+                    "position_above_rate": None,
                     "_ingested_at":     now_ts(),
                 })
         except Exception as e:
