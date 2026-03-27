@@ -1,0 +1,48 @@
+name: Facebook → BigQuery Sync
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Days of data to pull (default: 30)"
+        required: false
+        default: "30"
+
+jobs:
+  sync:
+    name: Sync Facebook Data to BigQuery
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Facebook → BigQuery sync
+        env:
+          FB_APP_ID:            ${{ secrets.FB_APP_ID }}
+          FB_APP_SECRET:        ${{ secrets.FB_APP_SECRET }}
+          FB_ACCESS_TOKEN:      ${{ secrets.FB_ACCESS_TOKEN }}
+          FB_BUSINESS_ID:       ${{ secrets.FB_BUSINESS_ID }}
+          FB_PAGE_ID:           ${{ secrets.FB_PAGE_ID }}
+          FB_PIXEL_ID:          ${{ secrets.FB_PIXEL_ID }}
+          GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET:           facebook_data
+          LOOKBACK_DAYS:        ${{ github.event.inputs.lookback_days || '30' }}
+        run: python facebook_to_bigquery.py
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ Facebook sync FAILED. Check logs above."
