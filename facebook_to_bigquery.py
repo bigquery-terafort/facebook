@@ -246,6 +246,53 @@ SCHEMAS = {
         bigquery.SchemaField("count",           "INTEGER"),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
+    # ── Post-level Insights ───────────────────────────────────────────────────
+    "post_insights": [
+        bigquery.SchemaField("post_id",         "STRING"),
+        bigquery.SchemaField("page_id",         "STRING"),
+        bigquery.SchemaField("message",         "STRING"),
+        bigquery.SchemaField("story",           "STRING"),
+        bigquery.SchemaField("created_time",    "TIMESTAMP"),
+        bigquery.SchemaField("post_impressions","INTEGER"),
+        bigquery.SchemaField("post_impressions_unique", "INTEGER"),
+        bigquery.SchemaField("post_engaged_users", "INTEGER"),
+        bigquery.SchemaField("post_clicks",     "INTEGER"),
+        bigquery.SchemaField("post_reactions_like_total", "INTEGER"),
+        bigquery.SchemaField("post_reactions_love_total", "INTEGER"),
+        bigquery.SchemaField("post_video_views", "INTEGER"),
+        bigquery.SchemaField("post_video_avg_time_watched", "FLOAT"),
+        bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
+    ],
+    # ── Audience Demographics ─────────────────────────────────────────────────
+    "audience_demographics": [
+        bigquery.SchemaField("page_id",         "STRING"),
+        bigquery.SchemaField("dimension",       "STRING"),  # age_gender / country / city
+        bigquery.SchemaField("key",             "STRING"),  # e.g. "M.25-34" or "US"
+        bigquery.SchemaField("value",           "FLOAT"),   # count or percentage
+        bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
+    ],
+    # ── Custom Audiences ──────────────────────────────────────────────────────
+    "custom_audiences": [
+        bigquery.SchemaField("account_id",          "STRING"),
+        bigquery.SchemaField("audience_id",         "STRING"),
+        bigquery.SchemaField("name",                "STRING"),
+        bigquery.SchemaField("subtype",             "STRING"),  # CUSTOM, LOOKALIKE, WEBSITE etc
+        bigquery.SchemaField("approximate_count",   "INTEGER"),
+        bigquery.SchemaField("data_source",         "STRING"),
+        bigquery.SchemaField("lookalike_spec",      "STRING"),
+        bigquery.SchemaField("retention_days",      "INTEGER"),
+        bigquery.SchemaField("created_time",        "TIMESTAMP"),
+        bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
+    ],
+    # ── Instagram Insights ────────────────────────────────────────────────────
+    "instagram_insights": [
+        bigquery.SchemaField("date",                "DATE"),
+        bigquery.SchemaField("instagram_account_id","STRING"),
+        bigquery.SchemaField("username",            "STRING"),
+        bigquery.SchemaField("metric_name",         "STRING"),
+        bigquery.SchemaField("value",               "FLOAT"),
+        bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
+    ],
 }
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -365,16 +412,41 @@ def load_to_bq(client, name, rows):
 # ─── GET ALL AD ACCOUNTS FROM BUSINESS MANAGER ────────────────────────────────
 def get_all_ad_accounts():
     log.info(f"Discovering all ad accounts from Business Manager {FB_BUSINESS_ID}...")
-    business = Business(FB_BUSINESS_ID)
-    accounts = business.get_owned_ad_accounts(fields=[
-        AdAccount.Field.id,
-        AdAccount.Field.name,
-        AdAccount.Field.account_status,
-    ])
-    active = [a for a in accounts if a.get("account_status") == 1]
-    log.info(f"  Found {len(active)} active ad accounts")
-    for a in active:
-        log.info(f"  → {a.get('name')} ({a.get('id')})")
+    import requests as req
+    resp = req.get(
+        f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/owned_ad_accounts",
+        params={
+            "fields": "id,name,account_status",
+            "limit":  100,
+            "access_token": FB_ACCESS_TOKEN,
+        }
+    ).json()
+    all_accounts = resp.get("data", [])
+    active = []
+    for a in all_accounts:
+        status = a.get("account_status")
+        name   = a.get("name")
+        act_id = a.get("id")
+        status_name = {1:"active",2:"disabled",3:"unsettled",7:"pending",9:"grace"}.get(status,"unknown")
+        log.info(f"  → {name} ({act_id}) — {status_name}")
+        if status == 1:
+            active.append(AdAccount(act_id))
+    # Also check client ad accounts
+    client_resp = req.get(
+        f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/client_ad_accounts",
+        params={
+            "fields": "id,name,account_status",
+            "limit":  100,
+            "access_token": FB_ACCESS_TOKEN,
+        }
+    ).json()
+    for a in client_resp.get("data", []):
+        if a.get("account_status") == 1:
+            act_id = a.get("id")
+            if not any(acc.get_id() == act_id for acc in active):
+                log.info(f"  → {a.get('name')} ({act_id}) — active (client account)")
+                active.append(AdAccount(act_id))
+    log.info(f"  Total {len(active)} active ad accounts")
     return active
 
 # ─── INSIGHTS FETCHER ─────────────────────────────────────────────────────────
@@ -658,6 +730,291 @@ def fetch_pixel_events(accounts):
             log.warning(f"  Pixel events error for {account.get('id')}: {e}")
     return rows
 
+# ─── POST INSIGHTS ───────────────────────────────────────────────────────────
+def fetch_post_insights():
+    log.info("Fetching Post-level Insights...")
+    if not FB_PAGE_ID:
+        return []
+    import requests as req
+    rows = []
+    start, end = date_range()
+    try:
+        # Get page access token
+        resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}",
+            params={"fields": "access_token", "access_token": FB_ACCESS_TOKEN}
+        ).json()
+        page_token = resp.get("access_token", FB_ACCESS_TOKEN)
+
+        # Get posts
+        posts_resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}/posts",
+            params={
+                "fields": "id,message,story,created_time",
+                "since": start, "until": end,
+                "limit": 100,
+                "access_token": page_token,
+            }
+        ).json()
+
+        posts = posts_resp.get("data", [])
+        log.info(f"  Found {len(posts)} posts")
+
+        for post in posts:
+            post_id = post.get("id")
+            # Get insights for each post
+            metrics = "post_impressions,post_impressions_unique,post_clicks,post_reactions_like_total,post_reactions_love_total,post_video_views"
+            ins_resp = req.get(
+                f"https://graph.facebook.com/v18.0/{post_id}/insights",
+                params={
+                    "metric": metrics,
+                    "access_token": page_token,
+                }
+            ).json()
+
+            ins_data = {i.get("name"): i.get("values", [{}])[0].get("value", 0)
+                       for i in ins_resp.get("data", [])}
+
+            rows.append({
+                "post_id":          post_id,
+                "page_id":          FB_PAGE_ID,
+                "message":          post.get("message", "")[:500],
+                "story":            post.get("story", ""),
+                "created_time":     parse_ts(post.get("created_time")),
+                "post_impressions": safe_int(ins_data.get("post_impressions")),
+                "post_impressions_unique": safe_int(ins_data.get("post_impressions_unique")),
+                "post_engaged_users": None,
+                "post_clicks":      safe_int(ins_data.get("post_clicks")),
+                "post_reactions_like_total": safe_int(ins_data.get("post_reactions_like_total")),
+                "post_reactions_love_total": safe_int(ins_data.get("post_reactions_love_total")),
+                "post_video_views": safe_int(ins_data.get("post_video_views")),
+                "post_video_avg_time_watched": None,
+                "_ingested_at":     now_ts(),
+            })
+    except Exception as e:
+        log.warning(f"  Post insights error: {e}")
+    return rows
+
+
+# ─── AUDIENCE DEMOGRAPHICS ────────────────────────────────────────────────────
+def fetch_audience_demographics():
+    log.info("Fetching Audience Demographics...")
+    if not FB_PAGE_ID:
+        return []
+    import requests as req
+    rows = []
+    try:
+        resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}",
+            params={"fields": "access_token", "access_token": FB_ACCESS_TOKEN}
+        ).json()
+        page_token = resp.get("access_token", FB_ACCESS_TOKEN)
+
+        # Age + Gender
+        ag_resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}/insights",
+            params={
+                "metric": "page_fans_gender_age",
+                "period": "lifetime",
+                "access_token": page_token,
+            }
+        ).json()
+        for item in ag_resp.get("data", []):
+            val = item.get("values", [{}])[-1].get("value", {})
+            for k, v in val.items():
+                rows.append({
+                    "page_id":   FB_PAGE_ID,
+                    "dimension": "age_gender",
+                    "key":       k,
+                    "value":     safe_float(v),
+                    "_ingested_at": now_ts(),
+                })
+
+        # Country
+        country_resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}/insights",
+            params={
+                "metric": "page_fans_country",
+                "period": "lifetime",
+                "access_token": page_token,
+            }
+        ).json()
+        for item in country_resp.get("data", []):
+            val = item.get("values", [{}])[-1].get("value", {})
+            for k, v in val.items():
+                rows.append({
+                    "page_id":   FB_PAGE_ID,
+                    "dimension": "country",
+                    "key":       k,
+                    "value":     safe_float(v),
+                    "_ingested_at": now_ts(),
+                })
+
+        # City
+        city_resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}/insights",
+            params={
+                "metric": "page_fans_city",
+                "period": "lifetime",
+                "access_token": page_token,
+            }
+        ).json()
+        for item in city_resp.get("data", []):
+            val = item.get("values", [{}])[-1].get("value", {})
+            for k, v in val.items():
+                rows.append({
+                    "page_id":   FB_PAGE_ID,
+                    "dimension": "city",
+                    "key":       k,
+                    "value":     safe_float(v),
+                    "_ingested_at": now_ts(),
+                })
+
+    except Exception as e:
+        log.warning(f"  Audience demographics error: {e}")
+    log.info(f"  Fetched {len(rows)} demographic rows")
+    return rows
+
+
+# ─── CUSTOM AUDIENCES ─────────────────────────────────────────────────────────
+def fetch_custom_audiences(accounts):
+    log.info("Fetching Custom Audiences...")
+    from facebook_business.adobjects.customaudience import CustomAudience
+    rows = []
+    fields = [
+        CustomAudience.Field.id,
+        CustomAudience.Field.name,
+        CustomAudience.Field.subtype,
+        CustomAudience.Field.approximate_count_lower_bound,
+        CustomAudience.Field.data_source,
+        CustomAudience.Field.lookalike_spec,
+        CustomAudience.Field.retention_days,
+        CustomAudience.Field.time_created,
+    ]
+    for account in accounts:
+        try:
+            for a in account.get_custom_audiences(fields=fields, params={"limit": 200}):
+                rows.append({
+                    "account_id":        account.get("id"),
+                    "audience_id":       a.get("id"),
+                    "name":              a.get("name"),
+                    "subtype":           a.get("subtype"),
+                    "approximate_count": safe_int(a.get("approximate_count_lower_bound")),
+                    "data_source":       json.dumps(a.get("data_source") or {}),
+                    "lookalike_spec":    json.dumps(a.get("lookalike_spec") or {}),
+                    "retention_days":    safe_int(a.get("retention_days")),
+                    "created_time":      parse_ts(a.get("time_created")),
+                    "_ingested_at":      now_ts(),
+                })
+        except Exception as e:
+            log.warning(f"  Custom audiences error for {account.get('id')}: {e}")
+    log.info(f"  Fetched {len(rows)} custom audiences")
+    return rows
+
+
+# ─── INSTAGRAM INSIGHTS ───────────────────────────────────────────────────────
+def fetch_instagram_insights():
+    log.info("Fetching Instagram Insights...")
+    if not FB_PAGE_ID:
+        return []
+    import requests as req
+    rows = []
+    start, end = date_range()
+    try:
+        # Get Instagram account connected to the page
+        resp = req.get(
+            f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}",
+            params={
+                "fields": "instagram_business_account,access_token",
+                "access_token": FB_ACCESS_TOKEN
+            }
+        ).json()
+        ig_account = resp.get("instagram_business_account", {})
+        ig_id      = ig_account.get("id") if ig_account else None
+        page_token = resp.get("access_token", FB_ACCESS_TOKEN)
+
+        if not ig_id:
+            log.info("  No Instagram account connected to this page")
+            return []
+
+        log.info(f"  Found Instagram account: {ig_id}")
+
+        # Get Instagram username
+        ig_resp = req.get(
+            f"https://graph.facebook.com/v18.0/{ig_id}",
+            params={"fields": "username", "access_token": page_token}
+        ).json()
+        username = ig_resp.get("username", "")
+
+        # Instagram metrics
+        metrics = [
+            "impressions",
+            "reach",
+            "profile_views",
+            "website_clicks",
+            "email_contacts",
+            "follower_count",
+            "get_directions_clicks",
+            "phone_call_clicks",
+            "text_message_clicks",
+        ]
+
+        for metric in metrics:
+            try:
+                ins_resp = req.get(
+                    f"https://graph.facebook.com/v18.0/{ig_id}/insights",
+                    params={
+                        "metric":  metric,
+                        "period":  "day",
+                        "since":   start,
+                        "until":   end,
+                        "access_token": page_token,
+                    }
+                ).json()
+                for item in ins_resp.get("data", []):
+                    for entry in item.get("values", []):
+                        rows.append({
+                            "date":                 entry.get("end_time", "")[:10],
+                            "instagram_account_id": ig_id,
+                            "username":             username,
+                            "metric_name":          metric,
+                            "value":                safe_float(entry.get("value")),
+                            "_ingested_at":         now_ts(),
+                        })
+            except Exception as e:
+                log.warning(f"  Instagram metric {metric} error: {e}")
+
+    except Exception as e:
+        log.warning(f"  Instagram insights error: {e}")
+    log.info(f"  Fetched {len(rows)} Instagram insight rows")
+    return rows
+
+
+# ─── FIX AD INSIGHTS — CHECK ALL ACCOUNTS INCLUDING INACTIVE ─────────────────
+def get_all_ad_accounts_including_inactive():
+    log.info(f"Discovering ALL ad accounts (including inactive)...")
+    import requests as req
+    resp = req.get(
+        f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/owned_ad_accounts",
+        params={
+            "fields": "id,name,account_status",
+            "limit":  100,
+            "access_token": FB_ACCESS_TOKEN,
+        }
+    ).json()
+    accounts = resp.get("data", [])
+    # Status: 1=active, 2=disabled, 3=unsettled, 7=pending review, 9=in grace period
+    result = []
+    for a in accounts:
+        status = a.get("account_status")
+        status_name = {1:"active",2:"disabled",3:"unsettled",7:"pending",9:"grace"}.get(status,"unknown")
+        log.info(f"  → {a.get('name')} ({a.get('id')}) — {status_name}")
+        if status == 1:
+            result.append(AdAccount(a.get("id")))
+    log.info(f"  {len(result)} active accounts found")
+    return result
+
+
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     log.info("🚀 Facebook → BigQuery COMPLETE sync")
@@ -710,7 +1067,20 @@ def main():
     load_to_bq(bq, "page_insights", fetch_page_insights())
     load_to_bq(bq, "pixel_events",  fetch_pixel_events(accounts))
 
-    log.info("✅ Facebook sync complete! 10 tables loaded.")
+    # New tables
+    log.info("── Post Insights ──")
+    load_to_bq(bq, "post_insights", fetch_post_insights())
+
+    log.info("── Audience Demographics ──")
+    load_to_bq(bq, "audience_demographics", fetch_audience_demographics())
+
+    log.info("── Custom Audiences ──")
+    load_to_bq(bq, "custom_audiences", fetch_custom_audiences(accounts))
+
+    log.info("── Instagram Insights ──")
+    load_to_bq(bq, "instagram_insights", fetch_instagram_insights())
+
+    log.info("✅ Facebook sync complete! 14 tables loaded.")
 
 if __name__ == "__main__":
     main()
