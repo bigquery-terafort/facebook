@@ -534,11 +534,21 @@ def get_insights(account, breakdowns, extra_keys, params_extra=None):
         params["breakdowns"] = breakdowns
     if params_extra:
         params.update(params_extra)
-    try:
-        return list(account.get_insights(fields=INSIGHT_FIELDS, params=params))
-    except Exception as e:
-        log.warning(f"  Insights error: {e}")
-        return []
+    # Retry up to 3 times on rate limit errors
+    for attempt in range(3):
+        try:
+            return list(account.get_insights(fields=INSIGHT_FIELDS, params=params))
+        except Exception as e:
+            err_str = str(e)
+            if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit reached" in err_str.lower():
+                wait = 60 * (attempt + 1)  # 60s, 120s, 180s
+                log.warning(f"  Rate limit hit — waiting {wait}s before retry {attempt+1}/3...")
+                time.sleep(wait)
+            else:
+                log.warning(f"  Insights error: {e}")
+                return []
+    log.warning(f"  Gave up after 3 retries due to rate limiting")
+    return []
 
 # ─── FETCH FUNCTIONS ──────────────────────────────────────────────────────────
 def fetch_ad_insights_daily(accounts):
