@@ -977,7 +977,7 @@ def fetch_custom_audiences(accounts):
                     "data_source":       data_source_str,
                     "lookalike_spec":    json.dumps(a.get("lookalike_spec") or {}),
                     "retention_days":    safe_int(a.get("retention_days")),
-                    "created_time":      parse_ts(a.get("time_created")),
+                    "created_time":      parse_ts(str(a.get("time_created", ""))) if a.get("time_created") else None,
                     "_ingested_at":      now_ts(),
                 })
         except Exception as e:
