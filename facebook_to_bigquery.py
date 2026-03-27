@@ -259,6 +259,12 @@ def safe_int(v):
 
 def now_ts(): return datetime.utcnow().isoformat()
 
+def parse_ts(ts):
+    """Convert Facebook timestamp to BigQuery format."""
+    if not ts: return None
+    # Remove timezone offset +0000 and replace T with space
+    return ts.replace("T", " ").replace("+0000", "").strip()
+
 def date_range():
     end   = datetime.utcnow().date()
     start = end - timedelta(days=LOOKBACK_DAYS)
@@ -462,10 +468,10 @@ def fetch_campaigns(accounts):
                     "lifetime_budget":  safe_float(c.get("lifetime_budget")),
                     "budget_remaining": safe_float(c.get("budget_remaining")),
                     "spend_cap":        safe_float(c.get("spend_cap")),
-                    "start_time":       c.get("start_time"),
-                    "stop_time":        c.get("stop_time"),
-                    "created_time":     c.get("created_time"),
-                    "updated_time":     c.get("updated_time"),
+                    "start_time":       parse_ts(c.get("start_time")),
+                    "stop_time":        parse_ts(c.get("stop_time")),
+                    "created_time":     parse_ts(c.get("created_time")),
+                    "updated_time":     parse_ts(c.get("updated_time")),
                     "_ingested_at":     now_ts(),
                 })
         except Exception as e:
@@ -512,10 +518,10 @@ def fetch_adsets(accounts):
                     "placements_publisher_platforms": json.dumps(t.get("publisher_platforms", [])),
                     "promoted_object_app_id":       po.get("application_id"),
                     "promoted_object_pixel_id":     po.get("pixel_id"),
-                    "start_time":                   s.get("start_time"),
-                    "end_time":                     s.get("end_time"),
-                    "created_time":                 s.get("created_time"),
-                    "updated_time":                 s.get("updated_time"),
+                    "start_time":                   parse_ts(s.get("start_time")),
+                    "end_time":                     parse_ts(s.get("end_time")),
+                    "created_time":                 parse_ts(s.get("created_time")),
+                    "updated_time":                 parse_ts(s.get("updated_time")),
                     "_ingested_at":                 now_ts(),
                 })
         except Exception as e:
@@ -548,8 +554,8 @@ def fetch_ads(accounts):
                     "creative_title":           cr.get("title") or cr.get("name"),
                     "creative_body":            cr.get("body") or ld.get("message"),
                     "creative_call_to_action":  (ld.get("call_to_action") or {}).get("type"),
-                    "created_time":             a.get("created_time"),
-                    "updated_time":             a.get("updated_time"),
+                    "created_time":             parse_ts(a.get("created_time")),
+                    "updated_time":             parse_ts(a.get("updated_time")),
                     "_ingested_at":             now_ts(),
                 })
         except Exception as e:
@@ -568,31 +574,32 @@ def fetch_page_insights():
         "page_engaged_users", "page_post_engagements",
         "page_views_total", "page_fans", "page_fan_adds", "page_fan_removes",
         "page_video_views", "page_video_views_unique",
-        "page_video_views_paid", "page_video_views_organic",
         "page_actions_post_reactions_total",
         "page_negative_feedback",
     ]
     start, end = date_range()
     rows = []
-    try:
-        for m in page.get_insights(params={
-            "metric": ",".join(metrics),
-            "period": "day",
-            "since":  start,
-            "until":  end,
-        }):
-            for entry in m.get("values", []):
-                val = entry.get("value")
-                rows.append({
-                    "date":         entry.get("end_time", "")[:10],
-                    "page_id":      FB_PAGE_ID,
-                    "metric_name":  m.get("name"),
-                    "value":        sum(val.values()) if isinstance(val, dict) else safe_float(val),
-                    "period":       m.get("period"),
-                    "_ingested_at": now_ts(),
-                })
-    except Exception as e:
-        log.warning(f"  Page insights error: {e}")
+    # Request each metric individually to avoid API errors
+    for metric in metrics:
+        try:
+            for m in page.get_insights(params={
+                "metric": metric,
+                "period": "day",
+                "since":  start,
+                "until":  end,
+            }):
+                for entry in m.get("values", []):
+                    val = entry.get("value")
+                    rows.append({
+                        "date":         entry.get("end_time", "")[:10],
+                        "page_id":      FB_PAGE_ID,
+                        "metric_name":  m.get("name"),
+                        "value":        sum(val.values()) if isinstance(val, dict) else safe_float(val),
+                        "period":       m.get("period"),
+                        "_ingested_at": now_ts(),
+                    })
+        except Exception as e:
+            log.warning(f"  Page metric {metric} error: {e}")
     return rows
 
 def fetch_pixel_events(accounts):
