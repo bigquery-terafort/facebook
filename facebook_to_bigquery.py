@@ -293,6 +293,72 @@ SCHEMAS = {
         bigquery.SchemaField("value",               "FLOAT"),
         bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
     ],
+    # ── Billing & Transactions ────────────────────────────────────────────────
+    "billing_transactions": [
+        bigquery.SchemaField("account_id",          "STRING"),
+        bigquery.SchemaField("transaction_id",      "STRING"),
+        bigquery.SchemaField("transaction_date",    "DATE"),
+        bigquery.SchemaField("amount",              "FLOAT"),
+        bigquery.SchemaField("currency",            "STRING"),
+        bigquery.SchemaField("transaction_type",    "STRING"),
+        bigquery.SchemaField("status",              "STRING"),
+        bigquery.SchemaField("product_type",        "STRING"),
+        bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
+    ],
+    # ── Auction Insights ──────────────────────────────────────────────────────
+    "auction_insights": [
+        bigquery.SchemaField("date_start",              "DATE"),
+        bigquery.SchemaField("account_id",              "STRING"),
+        bigquery.SchemaField("campaign_id",             "STRING"),
+        bigquery.SchemaField("campaign_name",           "STRING"),
+        bigquery.SchemaField("adset_id",                "STRING"),
+        bigquery.SchemaField("adset_name",              "STRING"),
+        bigquery.SchemaField("impression_share",        "FLOAT"),
+        bigquery.SchemaField("outranking_share",        "FLOAT"),
+        bigquery.SchemaField("overlap_rate",            "FLOAT"),
+        bigquery.SchemaField("position_above_rate",     "FLOAT"),
+        bigquery.SchemaField("_ingested_at",            "TIMESTAMP"),
+    ],
+    # ── App Events (Facebook SDK) ─────────────────────────────────────────────
+    "app_events": [
+        bigquery.SchemaField("date",                "DATE"),
+        bigquery.SchemaField("account_id",          "STRING"),
+        bigquery.SchemaField("app_id",              "STRING"),
+        bigquery.SchemaField("event_name",          "STRING"),
+        bigquery.SchemaField("count",               "INTEGER"),
+        bigquery.SchemaField("unique_users",        "INTEGER"),
+        bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
+    ],
+    # ── Ad Creative Details ───────────────────────────────────────────────────
+    "ad_creatives": [
+        bigquery.SchemaField("account_id",              "STRING"),
+        bigquery.SchemaField("creative_id",             "STRING"),
+        bigquery.SchemaField("name",                    "STRING"),
+        bigquery.SchemaField("title",                   "STRING"),
+        bigquery.SchemaField("body",                    "STRING"),
+        bigquery.SchemaField("call_to_action_type",     "STRING"),
+        bigquery.SchemaField("image_url",               "STRING"),
+        bigquery.SchemaField("thumbnail_url",           "STRING"),
+        bigquery.SchemaField("video_id",                "STRING"),
+        bigquery.SchemaField("link_url",                "STRING"),
+        bigquery.SchemaField("effective_object_story_id","STRING"),
+        bigquery.SchemaField("_ingested_at",            "TIMESTAMP"),
+    ],
+    # ── Reach & Frequency ─────────────────────────────────────────────────────
+    "reach_frequency": [
+        bigquery.SchemaField("date_start",          "DATE"),
+        bigquery.SchemaField("account_id",          "STRING"),
+        bigquery.SchemaField("campaign_id",         "STRING"),
+        bigquery.SchemaField("campaign_name",       "STRING"),
+        bigquery.SchemaField("adset_id",            "STRING"),
+        bigquery.SchemaField("adset_name",          "STRING"),
+        bigquery.SchemaField("reach",               "INTEGER"),
+        bigquery.SchemaField("frequency",           "FLOAT"),
+        bigquery.SchemaField("impressions",         "INTEGER"),
+        bigquery.SchemaField("spend",               "FLOAT"),
+        bigquery.SchemaField("cpp",                 "FLOAT"),
+        bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
+    ],
 }
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -990,6 +1056,225 @@ def fetch_instagram_insights():
     return rows
 
 
+# ─── BILLING TRANSACTIONS ────────────────────────────────────────────────────
+def fetch_billing_transactions(accounts):
+    log.info("Fetching Billing Transactions...")
+    import requests as req
+    rows = []
+    start, end = date_range()
+    for account in accounts:
+        try:
+            act_id = account.get_id().replace("act_", "")
+            resp = req.get(
+                f"https://graph.facebook.com/v18.0/act_{act_id}/transactions",
+                params={
+                    "fields": "id,time_start,amount,currency,fatura_id,product_type,status,tracking_id,transaction_type",
+                    "time_start": start,
+                    "time_stop":  end,
+                    "access_token": FB_ACCESS_TOKEN,
+                    "limit": 500,
+                }
+            ).json()
+            for t in resp.get("data", []):
+                rows.append({
+                    "account_id":       f"act_{act_id}",
+                    "transaction_id":   t.get("id"),
+                    "transaction_date": t.get("time_start", "")[:10] if t.get("time_start") else None,
+                    "amount":           safe_float(t.get("amount")),
+                    "currency":         t.get("currency"),
+                    "transaction_type": t.get("transaction_type"),
+                    "status":           t.get("status"),
+                    "product_type":     t.get("product_type"),
+                    "_ingested_at":     now_ts(),
+                })
+        except Exception as e:
+            log.warning(f"  Billing error for {account.get_id()}: {e}")
+    log.info(f"  Fetched {len(rows)} billing transactions")
+    return rows
+
+
+# ─── AUCTION INSIGHTS ────────────────────────────────────────────────────────
+def fetch_auction_insights(accounts):
+    log.info("Fetching Auction Insights...")
+    start, end = date_range()
+    rows = []
+    for account in accounts:
+        try:
+            insights = account.get_insights(
+                fields=[
+                    AdsInsights.Field.date_start,
+                    AdsInsights.Field.campaign_id,
+                    AdsInsights.Field.campaign_name,
+                    AdsInsights.Field.adset_id,
+                    AdsInsights.Field.adset_name,
+                    AdsInsights.Field.account_id,
+                    "auction_insight_impression_share",
+                    "auction_insight_outranking_share",
+                    "auction_insight_overlap_rate",
+                    "auction_insight_position_above_rate",
+                ],
+                params={
+                    "level":          "adset",
+                    "time_range":     {"since": start, "until": end},
+                    "time_increment": 1,
+                    "limit":          500,
+                }
+            )
+            for i in insights:
+                rows.append({
+                    "date_start":       i.get("date_start"),
+                    "account_id":       i.get("account_id"),
+                    "campaign_id":      i.get("campaign_id"),
+                    "campaign_name":    i.get("campaign_name"),
+                    "adset_id":         i.get("adset_id"),
+                    "adset_name":       i.get("adset_name"),
+                    "impression_share": safe_float(i.get("auction_insight_impression_share")),
+                    "outranking_share": safe_float(i.get("auction_insight_outranking_share")),
+                    "overlap_rate":     safe_float(i.get("auction_insight_overlap_rate")),
+                    "position_above_rate": safe_float(i.get("auction_insight_position_above_rate")),
+                    "_ingested_at":     now_ts(),
+                })
+        except Exception as e:
+            log.warning(f"  Auction insights error for {account.get_id()}: {e}")
+    log.info(f"  Fetched {len(rows)} auction insight rows")
+    return rows
+
+
+# ─── APP EVENTS (Facebook SDK) ────────────────────────────────────────────────
+def fetch_app_events(accounts):
+    log.info("Fetching App Events (Facebook SDK)...")
+    start, end = date_range()
+    rows = []
+    for account in accounts:
+        try:
+            insights = account.get_insights(
+                fields=[
+                    AdsInsights.Field.date_start,
+                    AdsInsights.Field.account_id,
+                    AdsInsights.Field.actions,
+                    "promoted_object",
+                ],
+                params={
+                    "level":          "account",
+                    "time_range":     {"since": start, "until": end},
+                    "time_increment": 1,
+                    "limit":          200,
+                }
+            )
+            for i in insights:
+                promo = i.get("promoted_object") or {}
+                app_id = promo.get("application_id", "")
+                for action in i.get("actions", []):
+                    action_type = action.get("action_type", "")
+                    if "app" in action_type or "mobile" in action_type:
+                        rows.append({
+                            "date":         i.get("date_start"),
+                            "account_id":   i.get("account_id"),
+                            "app_id":       app_id,
+                            "event_name":   action_type,
+                            "count":        safe_int(action.get("value")),
+                            "unique_users": None,
+                            "_ingested_at": now_ts(),
+                        })
+        except Exception as e:
+            log.warning(f"  App events error for {account.get_id()}: {e}")
+    log.info(f"  Fetched {len(rows)} app event rows")
+    return rows
+
+
+# ─── AD CREATIVE DETAILS ─────────────────────────────────────────────────────
+def fetch_ad_creatives(accounts):
+    log.info("Fetching Ad Creative Details...")
+    from facebook_business.adobjects.adcreative import AdCreative
+    rows = []
+    fields = [
+        AdCreative.Field.id,
+        AdCreative.Field.name,
+        AdCreative.Field.title,
+        AdCreative.Field.body,
+        AdCreative.Field.call_to_action_type,
+        AdCreative.Field.image_url,
+        AdCreative.Field.thumbnail_url,
+        AdCreative.Field.video_id,
+        AdCreative.Field.link_url,
+        AdCreative.Field.effective_object_story_id,
+        AdCreative.Field.object_story_spec,
+    ]
+    for account in accounts:
+        try:
+            for c in account.get_ad_creatives(fields=fields, params={"limit": 500}):
+                oss = c.get("object_story_spec") or {}
+                ld  = oss.get("link_data") or {}
+                vd  = oss.get("video_data") or {}
+                rows.append({
+                    "account_id":               account.get_id(),
+                    "creative_id":              c.get("id"),
+                    "name":                     c.get("name"),
+                    "title":                    c.get("title") or ld.get("name"),
+                    "body":                     c.get("body") or ld.get("message"),
+                    "call_to_action_type":      c.get("call_to_action_type") or (ld.get("call_to_action") or {}).get("type"),
+                    "image_url":                c.get("image_url") or vd.get("image_url"),
+                    "thumbnail_url":            c.get("thumbnail_url"),
+                    "video_id":                 c.get("video_id") or vd.get("video_id"),
+                    "link_url":                 c.get("link_url") or ld.get("link"),
+                    "effective_object_story_id": c.get("effective_object_story_id"),
+                    "_ingested_at":             now_ts(),
+                })
+        except Exception as e:
+            log.warning(f"  Creatives error for {account.get_id()}: {e}")
+    log.info(f"  Fetched {len(rows)} ad creatives")
+    return rows
+
+
+# ─── REACH & FREQUENCY ───────────────────────────────────────────────────────
+def fetch_reach_frequency(accounts):
+    log.info("Fetching Reach & Frequency...")
+    start, end = date_range()
+    rows = []
+    for account in accounts:
+        try:
+            insights = account.get_insights(
+                fields=[
+                    AdsInsights.Field.date_start,
+                    AdsInsights.Field.account_id,
+                    AdsInsights.Field.campaign_id,
+                    AdsInsights.Field.campaign_name,
+                    AdsInsights.Field.adset_id,
+                    AdsInsights.Field.adset_name,
+                    AdsInsights.Field.reach,
+                    AdsInsights.Field.frequency,
+                    AdsInsights.Field.impressions,
+                    AdsInsights.Field.spend,
+                    AdsInsights.Field.cpp,
+                ],
+                params={
+                    "level":          "adset",
+                    "time_range":     {"since": start, "until": end},
+                    "time_increment": 1,
+                    "limit":          500,
+                }
+            )
+            for i in insights:
+                rows.append({
+                    "date_start":   i.get("date_start"),
+                    "account_id":   i.get("account_id"),
+                    "campaign_id":  i.get("campaign_id"),
+                    "campaign_name":i.get("campaign_name"),
+                    "adset_id":     i.get("adset_id"),
+                    "adset_name":   i.get("adset_name"),
+                    "reach":        safe_int(i.get("reach")),
+                    "frequency":    safe_float(i.get("frequency")),
+                    "impressions":  safe_int(i.get("impressions")),
+                    "spend":        safe_float(i.get("spend")),
+                    "cpp":          safe_float(i.get("cpp")),
+                    "_ingested_at": now_ts(),
+                })
+        except Exception as e:
+            log.warning(f"  Reach/frequency error for {account.get_id()}: {e}")
+    log.info(f"  Fetched {len(rows)} reach/frequency rows")
+    return rows
+
+
 # ─── FIX AD INSIGHTS — CHECK ALL ACCOUNTS INCLUDING INACTIVE ─────────────────
 def get_all_ad_accounts_including_inactive():
     log.info(f"Discovering ALL ad accounts (including inactive)...")
@@ -1017,7 +1302,7 @@ def get_all_ad_accounts_including_inactive():
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery COMPLETE sync")
+    log.info(" Facebook → BigQuery COMPLETE sync")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days | Business: {FB_BUSINESS_ID}")
 
     # Use stable API version to avoid appsecret_proof issues
@@ -1080,7 +1365,14 @@ def main():
     log.info("── Instagram Insights ──")
     load_to_bq(bq, "instagram_insights", fetch_instagram_insights())
 
-    log.info("✅ Facebook sync complete! 14 tables loaded.")
+    log.info("── Billing, Auction & Creative ──")
+    load_to_bq(bq, "billing_transactions", fetch_billing_transactions(accounts))
+    load_to_bq(bq, "auction_insights",     fetch_auction_insights(accounts))
+    load_to_bq(bq, "app_events",           fetch_app_events(accounts))
+    load_to_bq(bq, "ad_creatives",         fetch_ad_creatives(accounts))
+    load_to_bq(bq, "reach_frequency",      fetch_reach_frequency(accounts))
+
+    log.info("✅ Facebook sync complete! 19 tables loaded.")
 
 if __name__ == "__main__":
     main()
