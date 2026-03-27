@@ -581,20 +581,19 @@ def fetch_page_insights():
         log.warning(f"  Could not get page token: {e}")
         page_token = FB_ACCESS_TOKEN
 
-    # Only valid metrics that work with page token
+    # Valid metrics — updated for New Page Experience (April 2024+)
     metrics = [
         "page_impressions",
         "page_impressions_unique",
         "page_impressions_paid",
-        "page_impressions_organic",
-        "page_engaged_users",
+        "page_impressions_organic_v2",       # replaces page_impressions_organic
+        "page_impressions_organic_unique_v2", # organic unique
         "page_post_engagements",
         "page_views_total",
-        "page_fans",
-        "page_fan_adds",
-        "page_fan_removes",
+        "page_fan_adds_unique",              # replaces page_fans / page_fan_adds
         "page_video_views",
         "page_video_views_unique",
+        "page_total_actions",               # replaces page_engaged_users
     ]
     start, end = date_range()
     rows = []
