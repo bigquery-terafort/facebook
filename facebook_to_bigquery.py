@@ -931,19 +931,21 @@ def fetch_adsets_for_account(account_id):
     fields = "id,campaign_id,name,status,effective_status,optimization_goal,billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,promoted_object,start_time,end_time,created_time,updated_time"
     url = f"https://graph.facebook.com/v18.0/{account_id}/adsets"
     all_adsets = []
-    params = {
+    first_params = {
         "fields": fields,
-        "limit": 50,  # small limit to avoid rate limits
+        "limit": 50,
         "access_token": FB_ACCESS_TOKEN,
     }
     page = 0
     while url:
         page += 1
+        succeeded = False
         for attempt in range(5):
             try:
-                resp = requests.get(url, params=params if page == 1 else {
-                    "access_token": FB_ACCESS_TOKEN
-                }).json()
+                if page == 1:
+                    resp = requests.get(url, params=first_params).json()
+                else:
+                    resp = requests.get(url, params={"access_token": FB_ACCESS_TOKEN}).json()
                 if "error" in resp:
                     err = resp["error"]
                     if err.get("code") in (17, 80000) or "rate" in str(err).lower() or "2446079" in str(err):
@@ -957,58 +959,55 @@ def fetch_adsets_for_account(account_id):
                 all_adsets.extend(resp.get("data", []))
                 log.info(f"  Got {len(resp.get('data', []))} adsets (page {page}, total {len(all_adsets)})")
                 url = resp.get("paging", {}).get("next")
-                time.sleep(3)  # pause between pages
+                time.sleep(3)
+                succeeded = True
                 break
             except Exception as e:
                 log.warning(f"  Adset fetch error page {page}: {e}")
                 return all_adsets
-        else:
+        if not succeeded:
             log.warning(f"  Gave up on adsets after 5 retries on page {page}")
             break
     return all_adsets
-
 
 def fetch_adsets(accounts):
     log.info("Fetching Ad Sets...")
     rows = []
     for account in accounts:
-        time.sleep(30)  # longer delay between accounts for adsets — most rate-limited endpoint
+        time.sleep(30)
         log.info(f"  Fetching adsets for {account.get_id()}...")
         adsets = fetch_adsets_for_account(account.get_id())
         for s in adsets:
-                t   = s.get("targeting") or {}
-                geo = t.get("geo_locations") or {}
-                po  = s.get("promoted_object") or {}
-                rows.append({
-                    "account_id":                   account.get_id(),
-                    "adset_id":                     s.get("id"),
-                    "campaign_id":                  s.get("campaign_id"),
-                    "name":                         s.get("name"),
-                    "status":                       s.get("status"),
-                    "effective_status":             s.get("effective_status"),
-                    "optimization_goal":            s.get("optimization_goal"),
-                    "billing_event":                s.get("billing_event"),
-                    "bid_strategy":                 s.get("bid_strategy"),
-                    "bid_amount":                   safe_float(s.get("bid_amount")),
-                    "daily_budget":                 safe_float(s.get("daily_budget")),
-                    "lifetime_budget":              safe_float(s.get("lifetime_budget")),
-                    "targeting_countries":          ",".join(geo.get("countries", [])),
-                    "targeting_age_min":            safe_int(t.get("age_min")),
-                    "targeting_age_max":            safe_int(t.get("age_max")),
-                    "targeting_genders":            json.dumps(t.get("genders", [])),
-                    "targeting_custom_audiences":   json.dumps([a.get("id") for a in t.get("custom_audiences", [])]),
-                    "placements_publisher_platforms": json.dumps(t.get("publisher_platforms", [])),
-                    "promoted_object_app_id":       po.get("application_id"),
-                    "promoted_object_pixel_id":     po.get("pixel_id"),
-                    "start_time":                   parse_ts(s.get("start_time")),
-                    "end_time":                     parse_ts(s.get("end_time")),
-                    "created_time":                 parse_ts(s.get("created_time")),
-                    "updated_time":                 parse_ts(s.get("updated_time")),
-                    "_ingested_at":                 now_ts(),
-                })
-        except Exception as e:
-            log.warning(f"  Adsets error for {account.get_id()}: {e}")
-        time.sleep(2)  # delay between accounts
+            t   = s.get("targeting") or {}
+            geo = t.get("geo_locations") or {}
+            po  = s.get("promoted_object") or {}
+            rows.append({
+                "account_id":                   account.get_id(),
+                "adset_id":                     s.get("id"),
+                "campaign_id":                  s.get("campaign_id"),
+                "name":                         s.get("name"),
+                "status":                       s.get("status"),
+                "effective_status":             s.get("effective_status"),
+                "optimization_goal":            s.get("optimization_goal"),
+                "billing_event":                s.get("billing_event"),
+                "bid_strategy":                 s.get("bid_strategy"),
+                "bid_amount":                   safe_float(s.get("bid_amount")),
+                "daily_budget":                 safe_float(s.get("daily_budget")),
+                "lifetime_budget":              safe_float(s.get("lifetime_budget")),
+                "targeting_countries":          ",".join(geo.get("countries", [])),
+                "targeting_age_min":            safe_int(t.get("age_min")),
+                "targeting_age_max":            safe_int(t.get("age_max")),
+                "targeting_genders":            json.dumps(t.get("genders", [])),
+                "targeting_custom_audiences":   json.dumps([a.get("id") for a in t.get("custom_audiences", [])]),
+                "placements_publisher_platforms": json.dumps(t.get("publisher_platforms", [])),
+                "promoted_object_app_id":       po.get("application_id"),
+                "promoted_object_pixel_id":     po.get("pixel_id"),
+                "start_time":                   parse_ts(s.get("start_time")),
+                "end_time":                     parse_ts(s.get("end_time")),
+                "created_time":                 parse_ts(s.get("created_time")),
+                "updated_time":                 parse_ts(s.get("updated_time")),
+                "_ingested_at":                 now_ts(),
+            })
     return rows
 
 
