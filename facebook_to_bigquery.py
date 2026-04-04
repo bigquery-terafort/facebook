@@ -879,8 +879,12 @@ def fetch_campaigns(accounts):
     ]
     rows = []
     for account in accounts:
+        time.sleep(2)
         try:
-            for c in account.get_campaigns(fields=fields, params={"limit": 500}):
+            campaigns = fetch_with_retry(
+                lambda: account.get_campaigns(fields=fields, params={"limit": 200})
+            )
+            for c in campaigns:
                 rows.append({
                     "account_id":       account.get_id(),
                     "campaign_id":      c.get("id"),
@@ -905,6 +909,23 @@ def fetch_campaigns(accounts):
     return rows
 
 
+def fetch_with_retry(fn, max_retries=3):
+    """Call fn() with exponential backoff on rate limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return list(fn())
+        except Exception as e:
+            err_str = str(e)
+            if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit reached" in err_str.lower() or "2446079" in err_str:
+                wait = 60 * (attempt + 1)
+                log.warning(f"  Rate limit — waiting {wait}s before retry {attempt+1}/{max_retries}...")
+                time.sleep(wait)
+            else:
+                raise e
+    log.warning(f"  Gave up after {max_retries} retries")
+    return []
+
+
 def fetch_adsets(accounts):
     log.info("Fetching Ad Sets...")
     fields = [
@@ -919,8 +940,12 @@ def fetch_adsets(accounts):
     ]
     rows = []
     for account in accounts:
+        time.sleep(2)  # small delay between accounts to avoid rate limits
         try:
-            for s in account.get_ad_sets(fields=fields, params={"limit": 500}):
+            adsets = fetch_with_retry(
+                lambda: account.get_ad_sets(fields=fields, params={"limit": 200})
+            )
+            for s in adsets:
                 t   = s.get("targeting") or {}
                 geo = t.get("geo_locations") or {}
                 po  = s.get("promoted_object") or {}
@@ -953,6 +978,7 @@ def fetch_adsets(accounts):
                 })
         except Exception as e:
             log.warning(f"  Adsets error for {account.get_id()}: {e}")
+        time.sleep(2)  # delay between accounts
     return rows
 
 
@@ -965,8 +991,12 @@ def fetch_ads(accounts):
     ]
     rows = []
     for account in accounts:
+        time.sleep(2)
         try:
-            for a in account.get_ads(fields=fields, params={"limit": 500}):
+            ads = fetch_with_retry(
+                lambda: account.get_ads(fields=fields, params={"limit": 200})
+            )
+            for a in ads:
                 cr  = a.get("creative") or {}
                 oss = cr.get("object_story_spec") or {}
                 ld  = oss.get("link_data") or {}
