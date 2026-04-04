@@ -909,15 +909,15 @@ def fetch_campaigns(accounts):
     return rows
 
 
-def fetch_with_retry(fn, max_retries=3):
+def fetch_with_retry(fn, max_retries=5):
     """Call fn() with exponential backoff on rate limit errors."""
     for attempt in range(max_retries):
         try:
             return list(fn())
         except Exception as e:
             err_str = str(e)
-            if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit reached" in err_str.lower() or "2446079" in err_str:
-                wait = 60 * (attempt + 1)
+            if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit reached" in err_str.lower() or "2446079" in err_str or "17" in err_str:
+                wait = 120 * (attempt + 1)  # 120s, 240s, 360s, 480s, 600s
                 log.warning(f"  Rate limit — waiting {wait}s before retry {attempt+1}/{max_retries}...")
                 time.sleep(wait)
             else:
@@ -926,26 +926,56 @@ def fetch_with_retry(fn, max_retries=3):
     return []
 
 
+def fetch_adsets_for_account(account_id):
+    """Fetch all adsets for a single account using direct REST API with pagination."""
+    fields = "id,campaign_id,name,status,effective_status,optimization_goal,billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,promoted_object,start_time,end_time,created_time,updated_time"
+    url = f"https://graph.facebook.com/v18.0/{account_id}/adsets"
+    all_adsets = []
+    params = {
+        "fields": fields,
+        "limit": 50,  # small limit to avoid rate limits
+        "access_token": FB_ACCESS_TOKEN,
+    }
+    page = 0
+    while url:
+        page += 1
+        for attempt in range(5):
+            try:
+                resp = requests.get(url, params=params if page == 1 else {
+                    "access_token": FB_ACCESS_TOKEN
+                }).json()
+                if "error" in resp:
+                    err = resp["error"]
+                    if err.get("code") in (17, 80000) or "rate" in str(err).lower() or "2446079" in str(err):
+                        wait = 120 * (attempt + 1)
+                        log.warning(f"  Rate limit on adsets page {page} — waiting {wait}s...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        log.warning(f"  Adset API error: {resp['error']}")
+                        return all_adsets
+                all_adsets.extend(resp.get("data", []))
+                log.info(f"  Got {len(resp.get('data', []))} adsets (page {page}, total {len(all_adsets)})")
+                url = resp.get("paging", {}).get("next")
+                time.sleep(3)  # pause between pages
+                break
+            except Exception as e:
+                log.warning(f"  Adset fetch error page {page}: {e}")
+                return all_adsets
+        else:
+            log.warning(f"  Gave up on adsets after 5 retries on page {page}")
+            break
+    return all_adsets
+
+
 def fetch_adsets(accounts):
     log.info("Fetching Ad Sets...")
-    fields = [
-        AdSet.Field.id, AdSet.Field.campaign_id, AdSet.Field.name,
-        AdSet.Field.status, AdSet.Field.effective_status,
-        AdSet.Field.optimization_goal, AdSet.Field.billing_event,
-        AdSet.Field.bid_strategy, AdSet.Field.bid_amount,
-        AdSet.Field.daily_budget, AdSet.Field.lifetime_budget,
-        AdSet.Field.targeting, AdSet.Field.promoted_object,
-        AdSet.Field.start_time, AdSet.Field.end_time,
-        AdSet.Field.created_time, AdSet.Field.updated_time,
-    ]
     rows = []
     for account in accounts:
-        time.sleep(2)  # small delay between accounts to avoid rate limits
-        try:
-            adsets = fetch_with_retry(
-                lambda: account.get_ad_sets(fields=fields, params={"limit": 200})
-            )
-            for s in adsets:
+        time.sleep(30)  # longer delay between accounts for adsets — most rate-limited endpoint
+        log.info(f"  Fetching adsets for {account.get_id()}...")
+        adsets = fetch_adsets_for_account(account.get_id())
+        for s in adsets:
                 t   = s.get("targeting") or {}
                 geo = t.get("geo_locations") or {}
                 po  = s.get("promoted_object") or {}
