@@ -1,19 +1,14 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v2
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3
 ==============================================
-Fixes applied vs v1:
-  1. Async job for insights — handles large date ranges correctly
-  2. Delete-before-insert — no duplicates on re-runs
-  3. outbound_clicks extracted correctly by action_type
-  4. Quality rankings pulled (quality_ranking, engagement_rate_ranking, conversion_rate_ranking)
-  5. Social proof pulled (inline_post_engagement, inline_link_clicks)
-  6. Attribution window pulled
-  7. Direct campaign-level AND adset-level insight pulls (not just ad level)
-  8. Account-level daily insights added
-  9. Ad delivery table added (quality rankings + delivery status per ad)
-  10. LOOKBACK_DAYS default changed to 7 for daily runs
-  11. Pagination added for account discovery
-  12. All insight levels pulled separately for exact UI match
+NEW IN v3 (vs v2):
+  - Added fb_apps_dim table — bridges Facebook application_id → package_name / bundle_id
+  - 3-layer resolution per app:
+      Layer 1: Graph API /{app_id}?fields=app_links → app_links.android[0].package
+      Layer 2: Parse object_store_urls.google_play URL → extract id= parameter
+      Layer 3: Fall back to terafort.cross_platform.app_mapping_manual via downstream join
+  - resolution_source column tells you which layer mapped each app
+  - raw_payload_json stores full Graph API response (forensic safety net)
 
 Tables:
   RAW INSIGHTS (pulled directly at each level):
@@ -40,6 +35,9 @@ Tables:
   17. pixel_events               — pixel conversion events
   18. page_insights              — page metrics daily
   19. custom_audiences           — audience lists
+
+  NEW IN v3:
+  20. fb_apps_dim                — Facebook app_id → package_name + bundle_id
 """
 
 import sys
@@ -49,6 +47,7 @@ print("Starting imports...", flush=True)
 print("Importing os, json, logging...", flush=True)
 import os, json, logging, time, re
 from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
 
 print("Importing facebook_business...", flush=True)
 from facebook_business.api import FacebookAdsApi
@@ -129,15 +128,12 @@ INSIGHT_FIELDS = [
     AdsInsights.Field.video_p100_watched_actions,
     AdsInsights.Field.outbound_clicks,
     AdsInsights.Field.outbound_clicks_ctr,
-    # FIX v2: quality rankings
     AdsInsights.Field.quality_ranking,
     AdsInsights.Field.engagement_rate_ranking,
     AdsInsights.Field.conversion_rate_ranking,
-    # FIX v2: social proof / inline engagement
     AdsInsights.Field.inline_post_engagement,
     AdsInsights.Field.inline_link_clicks,
     AdsInsights.Field.inline_link_click_ctr,
-    # FIX v2: attribution
     AdsInsights.Field.attribution_setting,
 ]
 
@@ -171,7 +167,6 @@ def kpi_fields():
         bigquery.SchemaField("video_p50_views",       "INTEGER"),
         bigquery.SchemaField("video_p75_views",       "INTEGER"),
         bigquery.SchemaField("video_p100_views",      "INTEGER"),
-        # v2 additions
         bigquery.SchemaField("quality_ranking",            "STRING"),
         bigquery.SchemaField("engagement_rate_ranking",    "STRING"),
         bigquery.SchemaField("conversion_rate_ranking",    "STRING"),
@@ -182,7 +177,6 @@ def kpi_fields():
     ]
 
 SCHEMAS = {
-    # ── Account Daily ──────────────────────────────────────────────────────────
     "account_daily": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -190,7 +184,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Campaign Daily Insights (direct pull) ─────────────────────────────────
     "campaign_daily_insights": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -201,7 +194,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Adset Daily Insights (direct pull) ────────────────────────────────────
     "adset_daily_insights": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -214,7 +206,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Ad Insights Daily ─────────────────────────────────────────────────────
     "ad_insights_daily": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("date_stop",       "DATE"),
@@ -231,7 +222,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Breakdown Tables ──────────────────────────────────────────────────────
     "ad_insights_by_country": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -276,7 +266,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Structure Tables ──────────────────────────────────────────────────────
     "campaigns": [
         bigquery.SchemaField("account_id",          "STRING"),
         bigquery.SchemaField("campaign_id",         "STRING"),
@@ -353,7 +342,6 @@ SCHEMAS = {
         bigquery.SchemaField("effective_object_story_id","STRING"),
         bigquery.SchemaField("_ingested_at",             "TIMESTAMP"),
     ],
-    # ── Ad Delivery (quality rankings + status) ───────────────────────────────
     "ad_delivery": [
         bigquery.SchemaField("date_start",                  "DATE"),
         bigquery.SchemaField("account_id",                  "STRING"),
@@ -370,7 +358,6 @@ SCHEMAS = {
         bigquery.SchemaField("spend",                       "FLOAT"),
         bigquery.SchemaField("_ingested_at",                "TIMESTAMP"),
     ],
-    # ── Additional Tables ─────────────────────────────────────────────────────
     "auction_insights": [
         bigquery.SchemaField("date_start",              "DATE"),
         bigquery.SchemaField("account_id",              "STRING"),
@@ -434,6 +421,24 @@ SCHEMAS = {
         bigquery.SchemaField("created_time",        "TIMESTAMP"),
         bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
     ],
+
+    # ── NEW IN v3: Facebook app_id → package_name / bundle_id bridge ────────
+    "fb_apps_dim": [
+        bigquery.SchemaField("app_id",              "STRING"),   # Facebook application_id
+        bigquery.SchemaField("app_name",            "STRING"),
+        bigquery.SchemaField("namespace",           "STRING"),
+        bigquery.SchemaField("category",            "STRING"),
+        bigquery.SchemaField("link",                "STRING"),
+        bigquery.SchemaField("package_name",        "STRING"),   # Android (com.example.app)
+        bigquery.SchemaField("bundle_id",           "STRING"),   # iOS bundle id (com.example.app)
+        bigquery.SchemaField("app_store_id",        "STRING"),   # iOS numeric app store id (id123456789)
+        bigquery.SchemaField("google_play_url",     "STRING"),   # raw Play Store URL
+        bigquery.SchemaField("itunes_url",          "STRING"),   # raw App Store URL
+        bigquery.SchemaField("resolution_source",   "STRING"),   # 'app_links' / 'object_store_url' / 'failed'
+        bigquery.SchemaField("api_error",           "STRING"),   # populated if Graph API returned error
+        bigquery.SchemaField("raw_payload_json",    "STRING"),   # full Graph API response (forensic)
+        bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
+    ],
 }
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -492,7 +497,6 @@ def build_kpi(insight):
     purch_val = extract_action_values(insight, ROAS_ACTIONS)
     spend     = safe_float(insight.get("spend")) or 0.0
 
-    # FIX v2: outbound_clicks extracted correctly by action_type
     outbound_clicks = next(
         (safe_int(x.get("value")) for x in insight.get("outbound_clicks", [])
          if x.get("action_type") == "outbound_click"), None
@@ -530,7 +534,6 @@ def build_kpi(insight):
         "video_p50_views":          extract_video(insight, "video_p50_watched_actions"),
         "video_p75_views":          extract_video(insight, "video_p75_watched_actions"),
         "video_p100_views":         extract_video(insight, "video_p100_watched_actions"),
-        # v2: quality rankings + social proof
         "quality_ranking":          insight.get("quality_ranking"),
         "engagement_rate_ranking":  insight.get("engagement_rate_ranking"),
         "conversion_rate_ranking":  insight.get("conversion_rate_ranking"),
@@ -571,7 +574,6 @@ def load_to_bq(client, name, rows):
     table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
     start, end = date_range()
 
-    # FIX v2: delete existing rows for date range before inserting — no duplicates
     date_col_map = {
         "ad_insights_daily":        "date_start",
         "ad_insights_by_country":   "date_start",
@@ -601,14 +603,13 @@ def load_to_bq(client, name, rows):
         except Exception as e:
             log.warning(f"  Could not clear existing rows for {name}: {e}")
     else:
-        # For structure tables (campaigns, adsets, ads etc) — truncate fully
+        # For structure tables (campaigns, adsets, ads, fb_apps_dim etc) — truncate fully
         try:
             client.query(f"TRUNCATE TABLE `{table_ref}`").result()
             log.info(f"  Truncated {name}")
         except Exception as e:
             log.warning(f"  Could not truncate {name}: {e}")
 
-    # Insert new rows in batches
     BATCH_SIZE = 200
     total_errors = []
     for i in range(0, len(rows), BATCH_SIZE):
@@ -625,11 +626,11 @@ def load_to_bq(client, name, rows):
     else:
         log.info(f"  ✅ {len(rows):,} rows → {name}")
 
+
 # ─── ACCOUNT DISCOVERY ───────────────────────────────────────────────────────
 def get_all_ad_accounts():
     log.info(f"Discovering all ad accounts from Business Manager {FB_BUSINESS_ID}...")
 
-    # Owned accounts
     owned_resp = requests.get(
         f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/owned_ad_accounts",
         params={
@@ -642,7 +643,6 @@ def get_all_ad_accounts():
 
     all_accounts = owned_resp.get("data", [])
 
-    # Client accounts
     client_resp = requests.get(
         f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/client_ad_accounts",
         params={
@@ -675,8 +675,8 @@ def get_all_ad_accounts():
     log.info(f"  Total {len(active)} accounts to process")
     return active
 
+
 # ─── ASYNC INSIGHTS FETCHER ───────────────────────────────────────────────────
-# FIX v2: use async jobs — handles large date ranges correctly
 def get_insights_async(account, level, breakdowns=None, extra_fields=None, params_extra=None):
     start, end = date_range()
     fields = INSIGHT_FIELDS[:]
@@ -696,14 +696,12 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
 
     for attempt in range(3):
         try:
-            # Create async job
             async_job = account.get_insights(
                 fields=fields,
                 params=params,
                 is_async=True
             )
 
-            # Poll until complete
             async_job = async_job.api_get()
             while async_job[AdReportRun.Field.async_status] != "Job Completed":
                 time.sleep(10)
@@ -715,7 +713,6 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
                     log.warning(f"    Async job failed: {status}")
                     return []
 
-            # Collect all results with pagination
             results = []
             cursor = async_job.get_result(params={"limit": 500})
             for row in cursor:
@@ -735,6 +732,7 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
 
     log.warning(f"    Gave up after 3 retries")
     return []
+
 
 # ─── FETCH FUNCTIONS ──────────────────────────────────────────────────────────
 
@@ -836,12 +834,10 @@ def fetch_breakdown(accounts, level, breakdowns, extra_keys):
 
 
 def fetch_ad_delivery(accounts):
-    """Quality rankings + delivery status per ad per day"""
     log.info("Fetching Ad Delivery (quality rankings)...")
     rows = []
     for account in accounts:
         for i in get_insights_async(account, level="ad"):
-            # Only store if quality ranking is available
             qr = i.get("quality_ranking")
             er = i.get("engagement_rate_ranking")
             cr = i.get("conversion_rate_ranking")
@@ -910,14 +906,13 @@ def fetch_campaigns(accounts):
 
 
 def fetch_with_retry(fn, max_retries=5):
-    """Call fn() with exponential backoff on rate limit errors."""
     for attempt in range(max_retries):
         try:
             return list(fn())
         except Exception as e:
             err_str = str(e)
             if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit reached" in err_str.lower() or "2446079" in err_str or "17" in err_str:
-                wait = 120 * (attempt + 1)  # 120s, 240s, 360s, 480s, 600s
+                wait = 120 * (attempt + 1)
                 log.warning(f"  Rate limit — waiting {wait}s before retry {attempt+1}/{max_retries}...")
                 time.sleep(wait)
             else:
@@ -927,7 +922,6 @@ def fetch_with_retry(fn, max_retries=5):
 
 
 def fetch_adsets_for_account(account_id):
-    """Fetch all adsets for a single account using direct REST API with pagination."""
     fields = "id,campaign_id,name,status,effective_status,optimization_goal,billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,promoted_object,start_time,end_time,created_time,updated_time"
     url = f"https://graph.facebook.com/v18.0/{account_id}/adsets"
     all_adsets = []
@@ -1282,9 +1276,220 @@ def fetch_custom_audiences(accounts):
     return rows
 
 
+# ─── NEW IN v3: FB APPS DIM ──────────────────────────────────────────────────
+
+def extract_package_from_play_url(play_url):
+    """Extract package_name from Google Play Store URL.
+    Example: https://play.google.com/store/apps/details?id=com.example.app
+             → 'com.example.app'
+    """
+    if not play_url:
+        return None
+    try:
+        parsed = urlparse(play_url)
+        # Standard format: ...details?id=PACKAGE
+        qs = parse_qs(parsed.query)
+        pkg = qs.get("id", [None])[0]
+        if pkg:
+            return pkg.strip()
+        # Alternative: regex fallback
+        m = re.search(r'[?&]id=([\w\.\-_]+)', play_url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def extract_appstore_id_from_itunes_url(itunes_url):
+    """Extract numeric app store id from iTunes URL.
+    Example: https://apps.apple.com/us/app/example-app/id123456789
+             → '123456789'
+    Note: This returns the numeric App Store ID, not the bundle_id.
+    Bundle ID typically must come from app_links.ios.
+    """
+    if not itunes_url:
+        return None
+    try:
+        m = re.search(r'/id(\d+)', itunes_url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def fetch_unique_promoted_app_ids(client):
+    """Read every distinct promoted_object_app_id from the adsets table that we just loaded.
+    These are the Facebook application_ids we need to look up.
+    """
+    table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.adsets"
+    sql = f"""
+        SELECT DISTINCT promoted_object_app_id AS app_id
+        FROM `{table_ref}`
+        WHERE promoted_object_app_id IS NOT NULL
+          AND promoted_object_app_id != ''
+    """
+    try:
+        result = client.query(sql).result()
+        ids = [row.app_id for row in result if row.app_id]
+        log.info(f"  Found {len(ids)} unique promoted_object_app_ids")
+        return ids
+    except Exception as e:
+        log.error(f"  Could not query adsets for app_ids: {e}")
+        return []
+
+
+def fetch_one_app_metadata(app_id):
+    """Hit Graph API for a single app_id and resolve package_name + bundle_id.
+    Three layers of resolution per app:
+        1. app_links.android[0].package / app_links.ios[0]
+        2. Parse object_store_urls.google_play / itunes
+        3. Fall back to None (downstream join to app_mapping_manual handles it)
+    Returns a dict ready to insert into fb_apps_dim.
+    """
+    fields = "id,name,namespace,category,link,app_links,object_store_urls"
+    url = f"https://graph.facebook.com/v18.0/{app_id}"
+
+    raw_response = {}
+    api_error = None
+    resolution_source = "failed"
+    package_name = None
+    bundle_id = None
+    app_store_id = None
+    google_play_url = None
+    itunes_url = None
+    name = None
+    namespace = None
+    category = None
+    link = None
+
+    for attempt in range(3):
+        try:
+            resp = requests.get(
+                url,
+                params={"fields": fields, "access_token": FB_ACCESS_TOKEN},
+                timeout=30
+            ).json()
+            raw_response = resp
+
+            if "error" in resp:
+                err = resp["error"]
+                api_error = json.dumps(err)[:500]
+                err_code = err.get("code")
+                # Rate limit codes
+                if err_code in (4, 17, 32, 613) or "rate" in str(err).lower():
+                    wait = 30 * (attempt + 1)
+                    log.warning(f"    Rate limit on app {app_id} — waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    log.warning(f"    App {app_id} API error: {err.get('message')}")
+                    break
+
+            # Got a clean response
+            name = resp.get("name")
+            namespace = resp.get("namespace")
+            category = resp.get("category")
+            link = resp.get("link")
+
+            # Layer 1: app_links
+            app_links = resp.get("app_links") or {}
+            android_arr = app_links.get("android") or []
+            ios_arr = app_links.get("ios") or []
+
+            if android_arr and isinstance(android_arr, list):
+                package_name = android_arr[0].get("package")
+            if ios_arr and isinstance(ios_arr, list):
+                # Sometimes "bundle_id" key, sometimes "app_store_id" — try both
+                bundle_id = ios_arr[0].get("bundle_id")
+                if not app_store_id:
+                    app_store_id = ios_arr[0].get("app_store_id")
+
+            # Capture store URLs regardless of layer
+            obj_urls = resp.get("object_store_urls") or {}
+            google_play_url = obj_urls.get("google_play")
+            itunes_url = obj_urls.get("itunes")
+
+            if package_name or bundle_id:
+                resolution_source = "app_links"
+
+            # Layer 2: parse store URLs if Layer 1 didn't give us values
+            if not package_name and google_play_url:
+                package_name = extract_package_from_play_url(google_play_url)
+                if package_name:
+                    resolution_source = "object_store_url"
+
+            if not app_store_id and itunes_url:
+                app_store_id = extract_appstore_id_from_itunes_url(itunes_url)
+                if not bundle_id and resolution_source == "failed":
+                    resolution_source = "object_store_url"
+
+            api_error = None  # success
+            break  # success — exit retry loop
+
+        except requests.exceptions.Timeout:
+            log.warning(f"    Timeout on app {app_id} — attempt {attempt+1}/3")
+            time.sleep(10 * (attempt + 1))
+        except Exception as e:
+            log.warning(f"    Exception on app {app_id}: {e}")
+            api_error = str(e)[:500]
+            break
+
+    return {
+        "app_id":            str(app_id),
+        "app_name":          name,
+        "namespace":         namespace,
+        "category":          category,
+        "link":              link,
+        "package_name":      package_name,
+        "bundle_id":         bundle_id,
+        "app_store_id":      app_store_id,
+        "google_play_url":   google_play_url,
+        "itunes_url":        itunes_url,
+        "resolution_source": resolution_source,
+        "api_error":         api_error,
+        "raw_payload_json":  json.dumps(raw_response, default=str)[:50000],
+        "_ingested_at":      now_ts(),
+    }
+
+
+def fetch_fb_apps(client):
+    """Discover unique promoted_object_app_ids from the just-loaded adsets table,
+    then call Graph API for each one to resolve package_name / bundle_id.
+
+    NOTE: this depends on adsets having been loaded already in the same run,
+    so it's invoked AFTER fetch_adsets in main().
+    """
+    log.info("Fetching FB Apps Dim (NEW IN v3)...")
+    app_ids = fetch_unique_promoted_app_ids(client)
+    if not app_ids:
+        log.warning("  No promoted_object_app_ids found in adsets — fb_apps_dim will be empty")
+        return []
+
+    log.info(f"  Resolving {len(app_ids)} app_ids via Graph API...")
+    rows = []
+    success = 0
+    failed = 0
+    for idx, app_id in enumerate(app_ids, start=1):
+        row = fetch_one_app_metadata(app_id)
+        rows.append(row)
+        if row["resolution_source"] != "failed":
+            success += 1
+        else:
+            failed += 1
+        # Be nice to the API — small delay between calls
+        if idx % 10 == 0:
+            log.info(f"    Progress: {idx}/{len(app_ids)} resolved (success={success}, failed={failed})")
+        time.sleep(0.3)
+
+    log.info(f"  ✓ {len(rows)} apps fetched. success={success}, failed={failed}")
+    return rows
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery COMPLETE sync v2")
+    log.info("🚀 Facebook → BigQuery COMPLETE sync v3 (with fb_apps_dim)")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days | Business: {FB_BUSINESS_ID}")
 
     FacebookAdsApi.init(
@@ -1351,7 +1556,12 @@ def main():
     load_to_bq(bq, "page_insights",    fetch_page_insights())
     load_to_bq(bq, "custom_audiences", fetch_custom_audiences(accounts))
 
-    log.info("✅ Facebook sync v2 complete! 19 tables loaded.")
+    # ── NEW IN v3: FB Apps Dim ─────────────────────────────────────────────────
+    # Must run AFTER fetch_adsets — depends on adsets table being populated
+    log.info("── FB Apps Dim (v3) ──")
+    load_to_bq(bq, "fb_apps_dim",      fetch_fb_apps(bq))
+
+    log.info("✅ Facebook sync v3 complete! 20 tables loaded.")
 
 
 if __name__ == "__main__":
