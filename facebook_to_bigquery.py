@@ -1,45 +1,12 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v2
+Facebook → BigQuery  ·  COMPLETE PIPELINE v2.1
 ==============================================
-Fixes applied vs v1:
-  1. Async job for insights — handles large date ranges correctly
-  2. Delete-before-insert — no duplicates on re-runs
-  3. outbound_clicks extracted correctly by action_type
-  4. Quality rankings pulled (quality_ranking, engagement_rate_ranking, conversion_rate_ranking)
-  5. Social proof pulled (inline_post_engagement, inline_link_clicks)
-  6. Attribution window pulled
-  7. Direct campaign-level AND adset-level insight pulls (not just ad level)
-  8. Account-level daily insights added
-  9. Ad delivery table added (quality rankings + delivery status per ad)
-  10. LOOKBACK_DAYS default changed to 7 for daily runs
-  11. Pagination added for account discovery
-  12. All insight levels pulled separately for exact UI match
+Fixes applied vs v2:
+  1. Extract object_store_url from adsets.promoted_object
+  2. Parse package_name (Android) and apple_app_store_id (iOS) from URL
+  3. Add 3 new columns to adsets table for direct mapping
 
-Tables:
-  RAW INSIGHTS (pulled directly at each level):
-  1.  account_daily              — account level daily stats
-  2.  campaign_daily_insights    — campaign level daily stats (direct pull)
-  3.  adset_daily_insights       — adset level daily stats (direct pull)
-  4.  ad_insights_daily          — ad level daily stats
-  5.  ad_insights_by_country     — ad level by country
-  6.  ad_insights_by_device      — ad level by device
-  7.  ad_insights_by_placement   — ad level by placement
-  8.  ad_insights_by_age_gender  — ad level by age + gender
-
-  STRUCTURE:
-  9.  campaigns                  — campaign settings
-  10. adsets                     — adset settings + targeting
-  11. ads                        — ad settings
-  12. ad_creatives               — creative details
-
-  ADDITIONAL:
-  13. ad_delivery                — quality rankings + delivery status per ad
-  14. auction_insights           — competitive data
-  15. reach_frequency            — reach + frequency at adset level
-  16. app_events                 — app events via Facebook SDK
-  17. pixel_events               — pixel conversion events
-  18. page_insights              — page metrics daily
-  19. custom_audiences           — audience lists
+Tables: 19 total (same as v2)
 """
 
 import sys
@@ -84,7 +51,7 @@ FB_PIXEL_ID          = os.environ.get("FB_PIXEL_ID", "")
 GCP_PROJECT          = os.environ["GCP_PROJECT"]
 BQ_DATASET           = os.environ.get("BQ_DATASET", "facebook_data")
 GCP_CREDENTIALS_JSON = os.environ["GCP_CREDENTIALS_JSON"]
-LOOKBACK_DAYS        = int(os.environ.get("LOOKBACK_DAYS", "7"))   # 7 for daily, 90 for initial load
+LOOKBACK_DAYS        = int(os.environ.get("LOOKBACK_DAYS", "7"))
 
 # ─── ACTION TYPES ────────────────────────────────────────────────────────────
 INSTALL_ACTIONS  = {"mobile_app_install", "app_install"}
@@ -129,15 +96,12 @@ INSIGHT_FIELDS = [
     AdsInsights.Field.video_p100_watched_actions,
     AdsInsights.Field.outbound_clicks,
     AdsInsights.Field.outbound_clicks_ctr,
-    # FIX v2: quality rankings
     AdsInsights.Field.quality_ranking,
     AdsInsights.Field.engagement_rate_ranking,
     AdsInsights.Field.conversion_rate_ranking,
-    # FIX v2: social proof / inline engagement
     AdsInsights.Field.inline_post_engagement,
     AdsInsights.Field.inline_link_clicks,
     AdsInsights.Field.inline_link_click_ctr,
-    # FIX v2: attribution
     AdsInsights.Field.attribution_setting,
 ]
 
@@ -171,7 +135,6 @@ def kpi_fields():
         bigquery.SchemaField("video_p50_views",       "INTEGER"),
         bigquery.SchemaField("video_p75_views",       "INTEGER"),
         bigquery.SchemaField("video_p100_views",      "INTEGER"),
-        # v2 additions
         bigquery.SchemaField("quality_ranking",            "STRING"),
         bigquery.SchemaField("engagement_rate_ranking",    "STRING"),
         bigquery.SchemaField("conversion_rate_ranking",    "STRING"),
@@ -182,7 +145,6 @@ def kpi_fields():
     ]
 
 SCHEMAS = {
-    # ── Account Daily ──────────────────────────────────────────────────────────
     "account_daily": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -190,7 +152,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Campaign Daily Insights (direct pull) ─────────────────────────────────
     "campaign_daily_insights": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -201,7 +162,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Adset Daily Insights (direct pull) ────────────────────────────────────
     "adset_daily_insights": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -214,7 +174,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Ad Insights Daily ─────────────────────────────────────────────────────
     "ad_insights_daily": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("date_stop",       "DATE"),
@@ -231,7 +190,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Breakdown Tables ──────────────────────────────────────────────────────
     "ad_insights_by_country": [
         bigquery.SchemaField("date_start",      "DATE"),
         bigquery.SchemaField("account_id",      "STRING"),
@@ -276,7 +234,6 @@ SCHEMAS = {
         *kpi_fields(),
         bigquery.SchemaField("_ingested_at",    "TIMESTAMP"),
     ],
-    # ── Structure Tables ──────────────────────────────────────────────────────
     "campaigns": [
         bigquery.SchemaField("account_id",          "STRING"),
         bigquery.SchemaField("campaign_id",         "STRING"),
@@ -296,6 +253,7 @@ SCHEMAS = {
         bigquery.SchemaField("updated_time",        "TIMESTAMP"),
         bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
     ],
+    # ── ADSETS — UPDATED with 3 new columns for package_name extraction ──
     "adsets": [
         bigquery.SchemaField("account_id",                      "STRING"),
         bigquery.SchemaField("adset_id",                        "STRING"),
@@ -317,6 +275,10 @@ SCHEMAS = {
         bigquery.SchemaField("placements_publisher_platforms",  "STRING"),
         bigquery.SchemaField("promoted_object_app_id",          "STRING"),
         bigquery.SchemaField("promoted_object_pixel_id",        "STRING"),
+        # NEW v2.1 fields for package_name mapping:
+        bigquery.SchemaField("promoted_object_object_store_url", "STRING"),
+        bigquery.SchemaField("promoted_object_android_package",  "STRING"),
+        bigquery.SchemaField("promoted_object_apple_app_store_id","STRING"),
         bigquery.SchemaField("start_time",                      "TIMESTAMP"),
         bigquery.SchemaField("end_time",                        "TIMESTAMP"),
         bigquery.SchemaField("created_time",                    "TIMESTAMP"),
@@ -353,7 +315,6 @@ SCHEMAS = {
         bigquery.SchemaField("effective_object_story_id","STRING"),
         bigquery.SchemaField("_ingested_at",             "TIMESTAMP"),
     ],
-    # ── Ad Delivery (quality rankings + status) ───────────────────────────────
     "ad_delivery": [
         bigquery.SchemaField("date_start",                  "DATE"),
         bigquery.SchemaField("account_id",                  "STRING"),
@@ -370,7 +331,6 @@ SCHEMAS = {
         bigquery.SchemaField("spend",                       "FLOAT"),
         bigquery.SchemaField("_ingested_at",                "TIMESTAMP"),
     ],
-    # ── Additional Tables ─────────────────────────────────────────────────────
     "auction_insights": [
         bigquery.SchemaField("date_start",              "DATE"),
         bigquery.SchemaField("account_id",              "STRING"),
@@ -455,6 +415,29 @@ def parse_ts(ts):
     ts = re.sub(r'[+-]\d{2}:\d{2}$', '', ts).strip()
     return ts
 
+# ── NEW v2.1: Package name extraction from object_store_url ──
+def extract_package_from_store_url(url):
+    """
+    Extract package_name (Android) or apple_app_store_id (iOS) from
+    Facebook's promoted_object.object_store_url.
+
+    Example URLs returned by Facebook:
+      Android: https://play.google.com/store/apps/details?id=com.example.app
+      iOS:     https://apps.apple.com/us/app/myapp/id1234567890
+
+    Returns: tuple (android_package, apple_app_store_id)
+             — both None if URL doesn't match either pattern
+    """
+    if not url:
+        return None, None
+    android_match = re.search(r'[?&]id=([\w.]+)', url)
+    if android_match:
+        return android_match.group(1), None
+    apple_match = re.search(r'/id(\d+)', url)
+    if apple_match:
+        return None, apple_match.group(1)
+    return None, None
+
 def date_range():
     end   = datetime.utcnow().date()
     start = end - timedelta(days=LOOKBACK_DAYS)
@@ -492,7 +475,6 @@ def build_kpi(insight):
     purch_val = extract_action_values(insight, ROAS_ACTIONS)
     spend     = safe_float(insight.get("spend")) or 0.0
 
-    # FIX v2: outbound_clicks extracted correctly by action_type
     outbound_clicks = next(
         (safe_int(x.get("value")) for x in insight.get("outbound_clicks", [])
          if x.get("action_type") == "outbound_click"), None
@@ -530,7 +512,6 @@ def build_kpi(insight):
         "video_p50_views":          extract_video(insight, "video_p50_watched_actions"),
         "video_p75_views":          extract_video(insight, "video_p75_watched_actions"),
         "video_p100_views":         extract_video(insight, "video_p100_watched_actions"),
-        # v2: quality rankings + social proof
         "quality_ranking":          insight.get("quality_ranking"),
         "engagement_rate_ranking":  insight.get("engagement_rate_ranking"),
         "conversion_rate_ranking":  insight.get("conversion_rate_ranking"),
@@ -571,7 +552,6 @@ def load_to_bq(client, name, rows):
     table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
     start, end = date_range()
 
-    # FIX v2: delete existing rows for date range before inserting — no duplicates
     date_col_map = {
         "ad_insights_daily":        "date_start",
         "ad_insights_by_country":   "date_start",
@@ -601,14 +581,12 @@ def load_to_bq(client, name, rows):
         except Exception as e:
             log.warning(f"  Could not clear existing rows for {name}: {e}")
     else:
-        # For structure tables (campaigns, adsets, ads etc) — truncate fully
         try:
             client.query(f"TRUNCATE TABLE `{table_ref}`").result()
             log.info(f"  Truncated {name}")
         except Exception as e:
             log.warning(f"  Could not truncate {name}: {e}")
 
-    # Insert new rows in batches
     BATCH_SIZE = 200
     total_errors = []
     for i in range(0, len(rows), BATCH_SIZE):
@@ -629,7 +607,6 @@ def load_to_bq(client, name, rows):
 def get_all_ad_accounts():
     log.info(f"Discovering all ad accounts from Business Manager {FB_BUSINESS_ID}...")
 
-    # Owned accounts
     owned_resp = requests.get(
         f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/owned_ad_accounts",
         params={
@@ -642,7 +619,6 @@ def get_all_ad_accounts():
 
     all_accounts = owned_resp.get("data", [])
 
-    # Client accounts
     client_resp = requests.get(
         f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/client_ad_accounts",
         params={
@@ -676,7 +652,6 @@ def get_all_ad_accounts():
     return active
 
 # ─── ASYNC INSIGHTS FETCHER ───────────────────────────────────────────────────
-# FIX v2: use async jobs — handles large date ranges correctly
 def get_insights_async(account, level, breakdowns=None, extra_fields=None, params_extra=None):
     start, end = date_range()
     fields = INSIGHT_FIELDS[:]
@@ -696,14 +671,12 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
 
     for attempt in range(3):
         try:
-            # Create async job
             async_job = account.get_insights(
                 fields=fields,
                 params=params,
                 is_async=True
             )
 
-            # Poll until complete
             async_job = async_job.api_get()
             while async_job[AdReportRun.Field.async_status] != "Job Completed":
                 time.sleep(10)
@@ -715,7 +688,6 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
                     log.warning(f"    Async job failed: {status}")
                     return []
 
-            # Collect all results with pagination
             results = []
             cursor = async_job.get_result(params={"limit": 500})
             for row in cursor:
@@ -836,12 +808,10 @@ def fetch_breakdown(accounts, level, breakdowns, extra_keys):
 
 
 def fetch_ad_delivery(accounts):
-    """Quality rankings + delivery status per ad per day"""
     log.info("Fetching Ad Delivery (quality rankings)...")
     rows = []
     for account in accounts:
         for i in get_insights_async(account, level="ad"):
-            # Only store if quality ranking is available
             qr = i.get("quality_ranking")
             er = i.get("engagement_rate_ranking")
             cr = i.get("conversion_rate_ranking")
@@ -917,7 +887,7 @@ def fetch_with_retry(fn, max_retries=5):
         except Exception as e:
             err_str = str(e)
             if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit reached" in err_str.lower() or "2446079" in err_str or "17" in err_str:
-                wait = 120 * (attempt + 1)  # 120s, 240s, 360s, 480s, 600s
+                wait = 120 * (attempt + 1)
                 log.warning(f"  Rate limit — waiting {wait}s before retry {attempt+1}/{max_retries}...")
                 time.sleep(wait)
             else:
@@ -928,7 +898,8 @@ def fetch_with_retry(fn, max_retries=5):
 
 def fetch_adsets_for_account(account_id):
     """Fetch all adsets for a single account using direct REST API with pagination."""
-    fields = "id,campaign_id,name,status,effective_status,optimization_goal,billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,promoted_object,start_time,end_time,created_time,updated_time"
+    # UPDATED v2.1: Explicitly request object_store_url within promoted_object
+    fields = "id,campaign_id,name,status,effective_status,optimization_goal,billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,promoted_object{application_id,object_store_url,pixel_id,custom_event_type},start_time,end_time,created_time,updated_time"
     url = f"https://graph.facebook.com/v18.0/{account_id}/adsets"
     all_adsets = []
     first_params = {
@@ -981,6 +952,11 @@ def fetch_adsets(accounts):
             t   = s.get("targeting") or {}
             geo = t.get("geo_locations") or {}
             po  = s.get("promoted_object") or {}
+
+            # NEW v2.1: extract object_store_url and parse package/store_id
+            store_url = po.get("object_store_url")
+            android_pkg, apple_store_id = extract_package_from_store_url(store_url)
+
             rows.append({
                 "account_id":                   account.get_id(),
                 "adset_id":                     s.get("id"),
@@ -1000,8 +976,12 @@ def fetch_adsets(accounts):
                 "targeting_genders":            json.dumps(t.get("genders", [])),
                 "targeting_custom_audiences":   json.dumps([a.get("id") for a in t.get("custom_audiences", [])]),
                 "placements_publisher_platforms": json.dumps(t.get("publisher_platforms", [])),
-                "promoted_object_app_id":       po.get("application_id"),
-                "promoted_object_pixel_id":     po.get("pixel_id"),
+                "promoted_object_app_id":         po.get("application_id"),
+                "promoted_object_pixel_id":       po.get("pixel_id"),
+                # NEW v2.1 fields:
+                "promoted_object_object_store_url":  store_url,
+                "promoted_object_android_package":   android_pkg,
+                "promoted_object_apple_app_store_id": apple_store_id,
                 "start_time":                   parse_ts(s.get("start_time")),
                 "end_time":                     parse_ts(s.get("end_time")),
                 "created_time":                 parse_ts(s.get("created_time")),
@@ -1284,7 +1264,7 @@ def fetch_custom_audiences(accounts):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery COMPLETE sync v2")
+    log.info("🚀 Facebook → BigQuery COMPLETE sync v2.1")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days | Business: {FB_BUSINESS_ID}")
 
     FacebookAdsApi.init(
@@ -1304,7 +1284,6 @@ def main():
     for t in SCHEMAS:
         ensure_table(bq, t)
 
-    # ── Insights (all levels) ──────────────────────────────────────────────────
     log.info("── Account Level Insights ──")
     load_to_bq(bq, "account_daily",             fetch_account_daily(accounts))
 
@@ -1331,18 +1310,15 @@ def main():
     load_to_bq(bq, "ad_insights_by_age_gender",
                fetch_breakdown(accounts, "ad", ["age", "gender"], ["age", "gender"]))
 
-    # ── Structure ──────────────────────────────────────────────────────────────
     log.info("── Campaign Structure ──")
     load_to_bq(bq, "campaigns",     fetch_campaigns(accounts))
     load_to_bq(bq, "adsets",        fetch_adsets(accounts))
     load_to_bq(bq, "ads",           fetch_ads(accounts))
     load_to_bq(bq, "ad_creatives",  fetch_ad_creatives(accounts))
 
-    # ── Ad Delivery ────────────────────────────────────────────────────────────
     log.info("── Ad Delivery ──")
     load_to_bq(bq, "ad_delivery",   fetch_ad_delivery(accounts))
 
-    # ── Additional ────────────────────────────────────────────────────────────
     log.info("── Additional Tables ──")
     load_to_bq(bq, "reach_frequency",  fetch_reach_frequency(accounts))
     load_to_bq(bq, "auction_insights", fetch_auction_insights(accounts))
@@ -1351,7 +1327,7 @@ def main():
     load_to_bq(bq, "page_insights",    fetch_page_insights())
     load_to_bq(bq, "custom_audiences", fetch_custom_audiences(accounts))
 
-    log.info("✅ Facebook sync v2 complete! 19 tables loaded.")
+    log.info("✅ Facebook sync v2.1 complete! 19 tables loaded.")
 
 
 if __name__ == "__main__":
