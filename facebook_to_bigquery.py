@@ -1,23 +1,79 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v2.1
-==============================================
-Fixes applied vs v2:
-  1. Extract object_store_url from adsets.promoted_object
-  2. Parse package_name (Android) and apple_app_store_id (iOS) from URL
-  3. Add 3 new columns to adsets table for direct mapping
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.0
+===============================================
+v2.1 → v3.0 — DATA-LOSS FIXES
 
-Tables: 19 total (same as v2)
+──────────────────────────────────────────────────────────────────────────────
+JO HUA (2026-08-27, saabit shuda)
+──────────────────────────────────────────────────────────────────────────────
+  Account 2032090687684703 "TF-Apps Zeeshan Ali New" ka poora data ur gaya:
+
+      30-din window ke ANDAR (07-28 → 08-27):  rows=0     🔴 DELETE hua
+      window se PEHLE      (07-16 → 07-27):    rows=1280  ✅ bacha
+      campaigns / adsets / ads:                rows=0     🔴 TRUNCATE ne saaf kiya
+
+      Nuqsan: $1,411.25 · 221 ads
+
+  Window ke bahar ka data bach gaya — yehi saabit karta hai ke DELETE ne
+  window ke andar ka data uda diya aur wo account load-list mein na hone ki
+  wajah se wapas nahi aaya.
+
+──────────────────────────────────────────────────────────────────────────────
+6 BUGS — sab v3 mein theek
+──────────────────────────────────────────────────────────────────────────────
+  BUG 1  DELETE saare accounts ka, LOAD sirf maujooda accounts ka
+         v2.1: DELETE FROM t WHERE date BETWEEN start AND end
+               (koi account_id filter nahi)
+         v3:   DELETE ... AND account_id IN UNNEST(@ok_accounts)
+               jahan ok_accounts = sirf wo accounts jo IS RUN mein
+               KAAMYABI se fetch huye.
+
+  BUG 2  fail aur "koi data nahi" mein farq nahi
+         v2.1: dono soorat mein `return []`
+         v3:   fail → `return None` (bilkul alag). None wale account ka
+               DELETE hota hi nahi — uska purana data mehfooz rehta hai.
+
+  BUG 3  polling loop mein koi timeout nahi (08-21 ka run 80% pe atka,
+         1 ghante baad GitHub ne maara)
+         v3:   MAX_POLL_SECONDS (default 900) + progress-stall detection.
+
+  BUG 4  account discovery mein na error check, na pagination
+         v2.1: requests.get(...).json().get("data", [])
+               API error → khamoshi se [] → sab kuch DELETE
+         v3:   "error" key check, raise_for_status, paging.next follow,
+               aur khali list pe sys.exit(1).
+
+  BUG 5  status == 1 filter — disabled/unsettled account list se gir jata
+         hai, aur BUG 1 uska data uda deta hai
+         v3:   saare accounts process hote hain (status sirf log hota hai).
+               ACTIVE_ONLY=1 se purana behaviour wapas laya ja sakta hai.
+
+  BUG 6  script kabhi fail nahi hoti — exit code hamesha 0
+         v3:   har fail track hota hai; aakhir mein sys.exit(1).
+               Workflow ab RED dikhega jab data mein masla ho.
+
+  + TRUNCATE guard: dimension tables (campaigns/adsets/ads/creatives/
+    audiences) tabhi truncate hote hain jab HAR account kaamyab ho.
+    Warna atomic per-account replace hota hai.
+
+──────────────────────────────────────────────────────────────────────────────
+NAYE ENV VARS (sab optional — defaults mehfooz hain)
+──────────────────────────────────────────────────────────────────────────────
+  MAX_POLL_SECONDS   900   ek async job kitni der tak poll ho (15 min)
+  POLL_INTERVAL      10    poll ke beech waqfa
+  ACTIVE_ONLY        0     1 = sirf status==1 accounts (v2.1 wala behaviour)
+  ALLOW_TRUNCATE     1     0 = dimension tables kabhi truncate na hon
+  DRY_RUN            0     1 = fetch to karo lekin BQ ko haath na lagao
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import sys
 print("Python version:", sys.version, flush=True)
 print("Starting imports...", flush=True)
 
-print("Importing os, json, logging...", flush=True)
 import os, json, logging, time, re
 from datetime import datetime, timedelta
 
-print("Importing facebook_business...", flush=True)
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.campaign import Campaign
@@ -29,11 +85,9 @@ from facebook_business.adobjects.adreportrun import AdReportRun
 from facebook_business.adobjects.adcreative import AdCreative
 from facebook_business.adobjects.customaudience import CustomAudience
 
-print("Importing google.cloud...", flush=True)
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
-print("Importing requests...", flush=True)
 import requests
 
 print("All imports done.", flush=True)
@@ -52,6 +106,22 @@ GCP_PROJECT          = os.environ["GCP_PROJECT"]
 BQ_DATASET           = os.environ.get("BQ_DATASET", "facebook_data")
 GCP_CREDENTIALS_JSON = os.environ["GCP_CREDENTIALS_JSON"]
 LOOKBACK_DAYS        = int(os.environ.get("LOOKBACK_DAYS", "7"))
+
+# 🆕 v3
+MAX_POLL_SECONDS = int(os.environ.get("MAX_POLL_SECONDS", "900"))
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "10"))
+ACTIVE_ONLY      = os.environ.get("ACTIVE_ONLY", "0") == "1"
+ALLOW_TRUNCATE   = os.environ.get("ALLOW_TRUNCATE", "1") == "1"
+DRY_RUN          = os.environ.get("DRY_RUN", "0") == "1"
+
+# 🆕 v3 — poore run ka sehat-nama. Koi bhi entry = exit(1).
+FAILURES = []
+
+def record_failure(where, detail):
+    """Har masla yahan darj hota hai. Aakhir mein exit code tay karta hai."""
+    msg = f"{where}: {detail}"
+    FAILURES.append(msg)
+    log.error(f"  ❌ {msg}")
 
 # ─── ACTION TYPES ────────────────────────────────────────────────────────────
 INSTALL_ACTIONS  = {"mobile_app_install", "app_install"}
@@ -253,7 +323,6 @@ SCHEMAS = {
         bigquery.SchemaField("updated_time",        "TIMESTAMP"),
         bigquery.SchemaField("_ingested_at",        "TIMESTAMP"),
     ],
-    # ── ADSETS — UPDATED with 3 new columns for package_name extraction ──
     "adsets": [
         bigquery.SchemaField("account_id",                      "STRING"),
         bigquery.SchemaField("adset_id",                        "STRING"),
@@ -275,7 +344,6 @@ SCHEMAS = {
         bigquery.SchemaField("placements_publisher_platforms",  "STRING"),
         bigquery.SchemaField("promoted_object_app_id",          "STRING"),
         bigquery.SchemaField("promoted_object_pixel_id",        "STRING"),
-        # NEW v2.1 fields for package_name mapping:
         bigquery.SchemaField("promoted_object_object_store_url", "STRING"),
         bigquery.SchemaField("promoted_object_android_package",  "STRING"),
         bigquery.SchemaField("promoted_object_apple_app_store_id","STRING"),
@@ -415,19 +483,17 @@ def parse_ts(ts):
     ts = re.sub(r'[+-]\d{2}:\d{2}$', '', ts).strip()
     return ts
 
-# ── NEW v2.1: Package name extraction from object_store_url ──
+def norm_acct(acct_id):
+    """`act_123` aur `123` ko ek hi shakl mein laata hai.
+    Insights `account_id` bina prefix ke deta hai, AdAccount.get_id() prefix ke saath.
+    DELETE guard ke liye dono ka match zaroori hai."""
+    if acct_id is None:
+        return None
+    s = str(acct_id).strip()
+    return s[4:] if s.startswith("act_") else s
+
 def extract_package_from_store_url(url):
-    """
-    Extract package_name (Android) or apple_app_store_id (iOS) from
-    Facebook's promoted_object.object_store_url.
-
-    Example URLs returned by Facebook:
-      Android: https://play.google.com/store/apps/details?id=com.example.app
-      iOS:     https://apps.apple.com/us/app/myapp/id1234567890
-
-    Returns: tuple (android_package, apple_app_store_id)
-             — both None if URL doesn't match either pattern
-    """
+    """promoted_object.object_store_url se android package ya apple id nikalta hai."""
     if not url:
         return None, None
     android_match = re.search(r'[?&]id=([\w.]+)', url)
@@ -544,115 +610,271 @@ def ensure_table(client, name):
         log.info(f"Creating table {name}")
         client.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
 
-def load_to_bq(client, name, rows):
-    if not rows:
-        log.info(f"  No rows for {name}")
-        return
+DATE_COL_MAP = {
+    "ad_insights_daily":        "date_start",
+    "ad_insights_by_country":   "date_start",
+    "ad_insights_by_device":    "date_start",
+    "ad_insights_by_placement": "date_start",
+    "ad_insights_by_age_gender":"date_start",
+    "account_daily":            "date_start",
+    "campaign_daily_insights":  "date_start",
+    "adset_daily_insights":     "date_start",
+    "ad_delivery":              "date_start",
+    "auction_insights":         "date_start",
+    "reach_frequency":          "date_start",
+    "pixel_events":             "date",
+    "app_events":               "date",
+    "page_insights":            "date",
+}
+
+# 🛡️ Ye tables account-scoped NAHI hain — inpe account guard nahi lag sakta.
+NO_ACCOUNT_TABLES = {"page_insights"}
+
+
+def load_to_bq(client, name, result):
+    """
+    🆕 v3 — DELETE ab account-scoped hai.
+
+    `result` ek tuple hai: (rows, ok_accounts)
+        rows        — jo BQ mein daalne hain
+        ok_accounts — un accounts ka set jo IS RUN mein KAAMYABI se fetch huye
+                      (normalized, bina `act_` prefix ke)
+
+    🛡️ BUG 1 KA FIX:
+       v2.1 poore date-range ka DELETE karta tha, phir sirf maujooda accounts
+       load karta tha. Jo account list se girta (disabled hua, access gayi,
+       ya fetch fail hua), uska data UR JATA tha aur wapas nahi aata.
+       Saabit: account 2032090687684703 ka 30-din window ka data rows=0 ho
+       gaya, jabke window se bahar ka 1,280 rows bach gaya.
+
+       Ab DELETE mein `AND account_id IN UNNEST(@ok)` lagta hai. Jo account
+       is run mein fetch NAHI hua, uska purana data bilkul nahi chhua jata.
+
+    🛡️ BUG 2 KA FIX (yahan ka hissa):
+       Agar ok_accounts KHALI hai to DELETE bilkul nahi hota — chahe rows
+       kitne bhi hon. Khali set ka matlab hai "kuch bhi bharose ke laaiq
+       fetch nahi hua".
+    """
+    rows, ok_accounts = result if isinstance(result, tuple) else (result, None)
 
     table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
     start, end = date_range()
+    date_col = DATE_COL_MAP.get(name)
 
-    date_col_map = {
-        "ad_insights_daily":        "date_start",
-        "ad_insights_by_country":   "date_start",
-        "ad_insights_by_device":    "date_start",
-        "ad_insights_by_placement": "date_start",
-        "ad_insights_by_age_gender":"date_start",
-        "account_daily":            "date_start",
-        "campaign_daily_insights":  "date_start",
-        "adset_daily_insights":     "date_start",
-        "ad_delivery":              "date_start",
-        "auction_insights":         "date_start",
-        "reach_frequency":          "date_start",
-        "pixel_events":             "date",
-        "app_events":               "date",
-        "page_insights":            "date",
-    }
+    if DRY_RUN:
+        log.info(f"  [DRY_RUN] {name}: {len(rows or []):,} rows, "
+                 f"{len(ok_accounts) if ok_accounts is not None else 'n/a'} ok accounts — BQ chhua nahi")
+        return
 
-    date_col = date_col_map.get(name)
+    if not rows:
+        # 🛡️ Khali nateeja pe kabhi DELETE/TRUNCATE nahi — purana data mehfooz.
+        log.warning(f"  ⚠️  {name}: 0 rows — DELETE/TRUNCATE nahi kiya (purana data mehfooz)")
+        return
+
+    # ── DATE-BASED TABLES ───────────────────────────────────────────────────
     if date_col:
-        try:
-            delete_sql = f"""
-                DELETE FROM `{table_ref}`
-                WHERE {date_col} BETWEEN '{start}' AND '{end}'
-            """
-            client.query(delete_sql).result()
-            log.info(f"  Cleared existing rows for {name} ({start} to {end})")
-        except Exception as e:
-            log.warning(f"  Could not clear existing rows for {name}: {e}")
-    else:
-        try:
-            client.query(f"TRUNCATE TABLE `{table_ref}`").result()
-            log.info(f"  Truncated {name}")
-        except Exception as e:
-            log.warning(f"  Could not truncate {name}: {e}")
+        if name in NO_ACCOUNT_TABLES:
+            # page_insights ka koi account_id nahi — purana behaviour
+            try:
+                client.query(
+                    f"DELETE FROM `{table_ref}` WHERE {date_col} BETWEEN '{start}' AND '{end}'"
+                ).result()
+                log.info(f"  Cleared {name} ({start} → {end})")
+            except Exception as e:
+                record_failure(f"delete[{name}]", e)
+                return
+        else:
+            if not ok_accounts:
+                record_failure(name, "ok_accounts khali — DELETE skip, kuch load nahi kiya")
+                return
 
+            ok_list = sorted(ok_accounts)
+            try:
+                job = client.query(
+                    f"""
+                    DELETE FROM `{table_ref}`
+                    WHERE {date_col} BETWEEN @start AND @end
+                      AND REPLACE(IFNULL(account_id,''), 'act_', '') IN UNNEST(@ok)
+                    """,
+                    job_config=bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter("start", "DATE", start),
+                            bigquery.ScalarQueryParameter("end",   "DATE", end),
+                            bigquery.ArrayQueryParameter("ok", "STRING", ok_list),
+                        ]
+                    ),
+                )
+                job.result()
+                log.info(f"  Cleared {name} ({start} → {end}) "
+                         f"for {len(ok_list)} fetched accounts only")
+            except Exception as e:
+                record_failure(f"delete[{name}]", e)
+                return
+
+    # ── DIMENSION TABLES (TRUNCATE) ─────────────────────────────────────────
+    else:
+        # 🛡️ TRUNCATE tabhi jab HAR account kaamyab ho. Warna account-scoped
+        #    DELETE — taake kisi gire hue account ki dimension rows na uden.
+        #    (v2.1 mein yahan hamesha TRUNCATE tha — isi liye campaigns/adsets/
+        #     ads mein us account ki 0 rows bachi thin.)
+        all_ok = ok_accounts is not None and len(ok_accounts) == len(ALL_DISCOVERED_ACCOUNTS)
+
+        if ALLOW_TRUNCATE and all_ok:
+            try:
+                client.query(f"TRUNCATE TABLE `{table_ref}`").result()
+                log.info(f"  Truncated {name} (saare {len(ok_accounts)} accounts kaamyab)")
+            except Exception as e:
+                record_failure(f"truncate[{name}]", e)
+                return
+        else:
+            if not ok_accounts:
+                record_failure(name, "ok_accounts khali — TRUNCATE skip")
+                return
+            ok_list = sorted(ok_accounts)
+            try:
+                client.query(
+                    f"""
+                    DELETE FROM `{table_ref}`
+                    WHERE REPLACE(IFNULL(account_id,''), 'act_', '') IN UNNEST(@ok)
+                    """,
+                    job_config=bigquery.QueryJobConfig(
+                        query_parameters=[bigquery.ArrayQueryParameter("ok", "STRING", ok_list)]
+                    ),
+                ).result()
+                log.warning(f"  ⚠️  {name}: TRUNCATE nahi kiya "
+                            f"({len(ok_list)}/{len(ALL_DISCOVERED_ACCOUNTS)} accounts kaamyab) — "
+                            f"sirf unhi ka data replace hua")
+            except Exception as e:
+                record_failure(f"delete[{name}]", e)
+                return
+
+    # ── LOAD ────────────────────────────────────────────────────────────────
     BATCH_SIZE = 200
     total_errors = []
+    failed_batches = 0
     for i in range(0, len(rows), BATCH_SIZE):
         batch = rows[i:i + BATCH_SIZE]
         try:
             errs = client.insert_rows_json(table_ref, batch)
             if errs:
                 total_errors.extend(errs[:2])
+                failed_batches += 1
         except Exception as e:
             log.error(f"  Batch {i} failed: {e}")
+            failed_batches += 1
 
-    if total_errors:
-        log.error(f"BQ errors [{name}]: {total_errors[:2]}")
+    if total_errors or failed_batches:
+        # 🛡️ BUG 6 KA FIX: DELETE ho chuka hai, load adhoora — ye SILENT nahi jayega.
+        record_failure(name, f"{failed_batches} batch fail, sample={total_errors[:1]}")
     else:
         log.info(f"  ✅ {len(rows):,} rows → {name}")
 
+
 # ─── ACCOUNT DISCOVERY ───────────────────────────────────────────────────────
+ALL_DISCOVERED_ACCOUNTS = set()   # normalized ids — TRUNCATE guard iske saath compare karta hai
+
+
+def _fetch_account_page(url, params):
+    """
+    🛡️ BUG 4 KA FIX: v2.1 seedha `.json().get("data", [])` karta tha.
+       API error (rate limit, token expiry) pe chup-chaap [] milta tha,
+       aur phir sab kuch DELETE ho jata tha. Ab error uthaya jata hai.
+    """
+    r = requests.get(url, params=params, timeout=60)
+    r.raise_for_status()
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"Facebook API error: {body['error']}")
+    return body
+
+
+def _collect_accounts(edge):
+    """owned_ad_accounts / client_ad_accounts — poori pagination ke saath."""
+    out = []
+    url = f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/{edge}"
+    params = {"fields": "id,name,account_status", "limit": 100, "access_token": FB_ACCESS_TOKEN}
+    page = 0
+    while url and page < 50:
+        page += 1
+        body = _fetch_account_page(url, params if page == 1 else {"access_token": FB_ACCESS_TOKEN})
+        data = body.get("data", [])
+        out.extend(data)
+        log.info(f"  {edge} page {page}: {len(data)} accounts (total {len(out)})")
+        url = body.get("paging", {}).get("next")   # 🆕 v3: pagination follow
+    return out
+
+
 def get_all_ad_accounts():
-    log.info(f"Discovering all ad accounts from Business Manager {FB_BUSINESS_ID}...")
+    """
+    🛡️ BUG 4 + BUG 5 KA FIX.
+       v2.1 sirf status==1 wale accounts leta tha. Jab koi account disabled
+       (2) / unsettled (3) hota, wo list se girta — aur BUG 1 ka global DELETE
+       uska data uda deta. Ab saare accounts process hote hain; status sirf
+       log hota hai. ACTIVE_ONLY=1 se purana behaviour wapas aa sakta hai.
+    """
+    global ALL_DISCOVERED_ACCOUNTS
+    log.info(f"Discovering ad accounts from Business Manager {FB_BUSINESS_ID}...")
 
-    owned_resp = requests.get(
-        f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/owned_ad_accounts",
-        params={
-            "fields": "id,name,account_status",
-            "limit": 100,
-            "access_token": FB_ACCESS_TOKEN,
-        }
-    ).json()
-    log.info(f"  Owned accounts raw response: {json.dumps(owned_resp)[:3000]}")
+    all_accounts = []
+    try:
+        all_accounts.extend(_collect_accounts("owned_ad_accounts"))
+    except Exception as e:
+        record_failure("account_discovery[owned]", e)
 
-    all_accounts = owned_resp.get("data", [])
+    try:
+        for a in _collect_accounts("client_ad_accounts"):
+            if not any(x.get("id") == a.get("id") for x in all_accounts):
+                all_accounts.append(a)
+    except Exception as e:
+        record_failure("account_discovery[client]", e)
 
-    client_resp = requests.get(
-        f"https://graph.facebook.com/v18.0/{FB_BUSINESS_ID}/client_ad_accounts",
-        params={
-            "fields": "id,name,account_status",
-            "limit": 100,
-            "access_token": FB_ACCESS_TOKEN,
-        }
-    ).json()
-    log.info(f"  Client accounts raw response: {json.dumps(client_resp)[:3000]}")
+    if not all_accounts:
+        # 🛡️ BUG 6: khali list pe kabhi aage mat barho — warna sab kuch ur jayega.
+        log.error("🔴 KOI ad account nahi mila — foran ruk rahe hain (data bachane ke liye)")
+        sys.exit(1)
 
-    for a in client_resp.get("data", []):
-        if not any(x.get("id") == a.get("id") for x in all_accounts):
-            all_accounts.append(a)
+    STATUS_NAMES = {1: "active", 2: "disabled", 3: "unsettled", 7: "pending",
+                    8: "pending_risk", 9: "grace", 100: "closed", 101: "any"}
 
-    log.info(f"  Total accounts found before status filter: {len(all_accounts)}")
-
-    active = []
+    selected = []
     for a in all_accounts:
         status = a.get("account_status")
-        status_name = {1: "active", 2: "disabled", 3: "unsettled", 7: "pending", 9: "grace"}.get(status, "unknown")
-        log.info(f"  Account: {a.get('name')} | ID: {a.get('id')} | Status code: {status} ({status_name})")
-        if status == 1:
-            active.append(AdAccount(a.get("id")))
+        sname  = STATUS_NAMES.get(status, "unknown")
+        aid    = a.get("id")
+        log.info(f"  Account: {a.get('name')} | ID: {aid} | Status: {status} ({sname})")
 
-    if not active:
-        log.warning("  No status=1 accounts found - using all accounts regardless of status")
-        for a in all_accounts:
-            active.append(AdAccount(a.get("id")))
+        if ACTIVE_ONLY and status != 1:
+            log.warning(f"    ⏭️  ACTIVE_ONLY=1 — skip (status {sname}). "
+                        f"Is account ka purana data CHHUA NAHI jayega.")
+            continue
 
-    log.info(f"  Total {len(active)} accounts to process")
-    return active
+        if status != 1:
+            log.warning(f"    ⚠️  Status '{sname}' — phir bhi process kar rahe hain "
+                        f"(v2.1 ise skip karta tha aur uska data uda deta tha)")
+
+        ALL_DISCOVERED_ACCOUNTS.add(norm_acct(aid))
+        selected.append(AdAccount(aid))
+
+    log.info(f"  Total {len(selected)} accounts process honge "
+             f"(discovered: {len(all_accounts)})")
+    return selected
 
 # ─── ASYNC INSIGHTS FETCHER ───────────────────────────────────────────────────
 def get_insights_async(account, level, breakdowns=None, extra_fields=None, params_extra=None):
+    """
+    🛡️ BUG 2 KA FIX — return value ab teen-tarfa hai:
+         list  → kaamyab (khali list = is account ka waqai koi data nahi)
+         None  → FAIL (job failed / timeout / exception)
+
+       v2.1 dono soorat mein `[]` deta tha, isliye caller ko pata hi nahi
+       chalta tha ke account fail hua ya khali tha — aur global DELETE us
+       account ka data uda deta tha.
+
+    🛡️ BUG 3 KA FIX — polling ab bounded hai:
+       v2.1: `while status != "Job Completed"` — koi limit nahi.
+       08-21 ka run 80% pe atka raha, 1 ghante baad GitHub ne maar diya.
+       Ab MAX_POLL_SECONDS (default 900s) ke baad None return hota hai.
+    """
     start, end = date_range()
     fields = INSIGHT_FIELDS[:]
     if extra_fields:
@@ -669,129 +891,178 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
     if params_extra:
         params.update(params_extra)
 
+    acct_label = account.get_id()
+
     for attempt in range(3):
         try:
-            async_job = account.get_insights(
-                fields=fields,
-                params=params,
-                is_async=True
-            )
-
+            async_job = account.get_insights(fields=fields, params=params, is_async=True)
             async_job = async_job.api_get()
-            while async_job[AdReportRun.Field.async_status] != "Job Completed":
-                time.sleep(10)
-                async_job = async_job.api_get()
-                status  = async_job[AdReportRun.Field.async_status]
-                percent = async_job.get(AdReportRun.Field.async_percent_completion, 0)
-                log.info(f"    Job status: {status} ({percent}%)")
+
+            waited = 0
+            last_pct = -1
+            stall = 0
+            while True:
+                status = async_job[AdReportRun.Field.async_status]
+                if status == "Job Completed":
+                    break
                 if status in ("Job Failed", "Job Skipped"):
-                    log.warning(f"    Async job failed: {status}")
-                    return []
+                    log.warning(f"    Async job {status} ({acct_label})")
+                    return None                      # 🛡️ fail — [] NAHI
+
+                if waited >= MAX_POLL_SECONDS:
+                    log.warning(f"    ⏱️  Timeout {MAX_POLL_SECONDS}s pe "
+                                f"({last_pct}% pe atka, {acct_label})")
+                    return None                      # 🛡️ timeout — [] NAHI
+
+                time.sleep(POLL_INTERVAL)
+                waited += POLL_INTERVAL
+                async_job = async_job.api_get()
+                pct = async_job.get(AdReportRun.Field.async_percent_completion, 0)
+
+                # progress ruk gaya to har poll pe log mat bharo
+                if pct != last_pct:
+                    log.info(f"    Job status: {async_job[AdReportRun.Field.async_status]} "
+                             f"({pct}%) — {waited}s")
+                    last_pct, stall = pct, 0
+                else:
+                    stall += 1
+                    if stall % 6 == 0:
+                        log.info(f"    ...abhi bhi {pct}% pe ({waited}s / {MAX_POLL_SECONDS}s)")
 
             results = []
             cursor = async_job.get_result(params={"limit": 500})
             for row in cursor:
                 results.append(row)
-            log.info(f"    Got {len(results):,} rows (account {account.get_id()})")
+            log.info(f"    Got {len(results):,} rows ({acct_label})")
             return results
 
         except Exception as e:
             err_str = str(e)
-            if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit" in err_str.lower():
+            if any(w in err_str.lower() for w in ("rate", "too many", "limit")):
                 wait = 60 * (attempt + 1)
-                log.warning(f"    Rate limit — waiting {wait}s before retry {attempt+1}/3...")
+                log.warning(f"    Rate limit — {wait}s wait, retry {attempt+1}/3 ({acct_label})")
                 time.sleep(wait)
             else:
-                log.warning(f"    Insights error: {e}")
-                return []
+                log.warning(f"    Insights error ({acct_label}): {e}")
+                return None                          # 🛡️ fail — [] NAHI
 
-    log.warning(f"    Gave up after 3 retries")
-    return []
+    log.warning(f"    3 retries ke baad haar gaye ({acct_label})")
+    return None                                      # 🛡️ fail — [] NAHI
+
+
+def _run_per_account(accounts, fn, label):
+    """
+    🆕 v3 — har fetch isi se guzarta hai.
+
+    Returns (rows, ok_accounts):
+        ok_accounts = sirf wo accounts jinka fetch KAAMYAB raha.
+        Jis account ka fetch None de, wo ok_accounts mein NAHI aata —
+        aur load_to_bq uska purana data bilkul nahi chhuta.
+    """
+    rows, ok = [], set()
+    for account in accounts:
+        aid = norm_acct(account.get_id())
+        try:
+            out = fn(account)
+        except Exception as e:
+            record_failure(f"{label}[{aid}]", e)
+            continue
+
+        if out is None:
+            record_failure(f"{label}[{aid}]", "fetch fail — is account ka data CHHUA NAHI jayega")
+            continue
+
+        rows.extend(out)
+        ok.add(aid)
+    log.info(f"  {label}: {len(rows):,} rows from {len(ok)}/{len(accounts)} accounts")
+    return rows, ok
+
 
 # ─── FETCH FUNCTIONS ──────────────────────────────────────────────────────────
-
 def fetch_account_daily(accounts):
     log.info("Fetching Account Daily...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="account"):
-            rows.append({
-                "date_start":   i.get("date_start"),
-                "account_id":   i.get("account_id"),
-                "account_name": i.get("account_name"),
-                **build_kpi(i),
-                "_ingested_at": now_ts(),
-            })
-    return rows
+    def one(account):
+        ins = get_insights_async(account, level="account")
+        if ins is None: return None
+        return [{
+            "date_start":   i.get("date_start"),
+            "account_id":   i.get("account_id"),
+            "account_name": i.get("account_name"),
+            **build_kpi(i),
+            "_ingested_at": now_ts(),
+        } for i in ins]
+    return _run_per_account(accounts, one, "account_daily")
 
 
 def fetch_campaign_daily_insights(accounts):
-    log.info("Fetching Campaign Daily Insights (direct pull)...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="campaign"):
-            rows.append({
-                "date_start":    i.get("date_start"),
-                "account_id":    i.get("account_id"),
-                "campaign_id":   i.get("campaign_id"),
-                "campaign_name": i.get("campaign_name"),
-                "objective":     i.get("objective"),
-                "buying_type":   i.get("buying_type"),
-                **build_kpi(i),
-                "_ingested_at":  now_ts(),
-            })
-    return rows
+    log.info("Fetching Campaign Daily Insights...")
+    def one(account):
+        ins = get_insights_async(account, level="campaign")
+        if ins is None: return None
+        return [{
+            "date_start":    i.get("date_start"),
+            "account_id":    i.get("account_id"),
+            "campaign_id":   i.get("campaign_id"),
+            "campaign_name": i.get("campaign_name"),
+            "objective":     i.get("objective"),
+            "buying_type":   i.get("buying_type"),
+            **build_kpi(i),
+            "_ingested_at":  now_ts(),
+        } for i in ins]
+    return _run_per_account(accounts, one, "campaign_daily_insights")
 
 
 def fetch_adset_daily_insights(accounts):
-    log.info("Fetching Adset Daily Insights (direct pull)...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="adset"):
-            rows.append({
-                "date_start":    i.get("date_start"),
-                "account_id":    i.get("account_id"),
-                "campaign_id":   i.get("campaign_id"),
-                "campaign_name": i.get("campaign_name"),
-                "adset_id":      i.get("adset_id"),
-                "adset_name":    i.get("adset_name"),
-                "objective":     i.get("objective"),
-                "buying_type":   i.get("buying_type"),
-                **build_kpi(i),
-                "_ingested_at":  now_ts(),
-            })
-    return rows
+    log.info("Fetching Adset Daily Insights...")
+    def one(account):
+        ins = get_insights_async(account, level="adset")
+        if ins is None: return None
+        return [{
+            "date_start":    i.get("date_start"),
+            "account_id":    i.get("account_id"),
+            "campaign_id":   i.get("campaign_id"),
+            "campaign_name": i.get("campaign_name"),
+            "adset_id":      i.get("adset_id"),
+            "adset_name":    i.get("adset_name"),
+            "objective":     i.get("objective"),
+            "buying_type":   i.get("buying_type"),
+            **build_kpi(i),
+            "_ingested_at":  now_ts(),
+        } for i in ins]
+    return _run_per_account(accounts, one, "adset_daily_insights")
 
 
 def fetch_ad_insights_daily(accounts):
     log.info("Fetching Ad Insights Daily...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="ad"):
-            rows.append({
-                "date_start":    i.get("date_start"),
-                "date_stop":     i.get("date_stop"),
-                "account_id":    i.get("account_id"),
-                "account_name":  i.get("account_name"),
-                "campaign_id":   i.get("campaign_id"),
-                "campaign_name": i.get("campaign_name"),
-                "adset_id":      i.get("adset_id"),
-                "adset_name":    i.get("adset_name"),
-                "ad_id":         i.get("ad_id"),
-                "ad_name":       i.get("ad_name"),
-                "objective":     i.get("objective"),
-                "buying_type":   i.get("buying_type"),
-                **build_kpi(i),
-                "_ingested_at":  now_ts(),
-            })
-    return rows
+    def one(account):
+        ins = get_insights_async(account, level="ad")
+        if ins is None: return None
+        return [{
+            "date_start":    i.get("date_start"),
+            "date_stop":     i.get("date_stop"),
+            "account_id":    i.get("account_id"),
+            "account_name":  i.get("account_name"),
+            "campaign_id":   i.get("campaign_id"),
+            "campaign_name": i.get("campaign_name"),
+            "adset_id":      i.get("adset_id"),
+            "adset_name":    i.get("adset_name"),
+            "ad_id":         i.get("ad_id"),
+            "ad_name":       i.get("ad_name"),
+            "objective":     i.get("objective"),
+            "buying_type":   i.get("buying_type"),
+            **build_kpi(i),
+            "_ingested_at":  now_ts(),
+        } for i in ins]
+    return _run_per_account(accounts, one, "ad_insights_daily")
 
 
-def fetch_breakdown(accounts, level, breakdowns, extra_keys):
+def fetch_breakdown(accounts, level, breakdowns, extra_keys, label):
     log.info(f"Fetching breakdown: {breakdowns}...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level=level, breakdowns=breakdowns):
+    def one(account):
+        ins = get_insights_async(account, level=level, breakdowns=breakdowns)
+        if ins is None: return None
+        out = []
+        for i in ins:
             row = {
                 "date_start":  i.get("date_start"),
                 "account_id":  i.get("account_id"),
@@ -803,20 +1074,22 @@ def fetch_breakdown(accounts, level, breakdowns, extra_keys):
                 row[key] = i.get(key)
             row.update(build_kpi(i))
             row["_ingested_at"] = now_ts()
-            rows.append(row)
-    return rows
+            out.append(row)
+        return out
+    return _run_per_account(accounts, one, label)
 
 
 def fetch_ad_delivery(accounts):
     log.info("Fetching Ad Delivery (quality rankings)...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="ad"):
-            qr = i.get("quality_ranking")
-            er = i.get("engagement_rate_ranking")
-            cr = i.get("conversion_rate_ranking")
+    def one(account):
+        ins = get_insights_async(account, level="ad")
+        if ins is None: return None
+        out = []
+        for i in ins:
+            qr, er, cr = (i.get("quality_ranking"), i.get("engagement_rate_ranking"),
+                          i.get("conversion_rate_ranking"))
             if any([qr, er, cr]):
-                rows.append({
+                out.append({
                     "date_start":               i.get("date_start"),
                     "account_id":               i.get("account_id"),
                     "campaign_id":              i.get("campaign_id"),
@@ -832,7 +1105,85 @@ def fetch_ad_delivery(accounts):
                     "spend":                    safe_float(i.get("spend")),
                     "_ingested_at":             now_ts(),
                 })
-    return rows
+        return out
+    return _run_per_account(accounts, one, "ad_delivery")
+
+
+def fetch_reach_frequency(accounts):
+    log.info("Fetching Reach & Frequency...")
+    def one(account):
+        ins = get_insights_async(account, level="adset", extra_fields=[
+            AdsInsights.Field.campaign_name, AdsInsights.Field.adset_name])
+        if ins is None: return None
+        return [{
+            "date_start":    i.get("date_start"),
+            "account_id":    i.get("account_id"),
+            "campaign_id":   i.get("campaign_id"),
+            "campaign_name": i.get("campaign_name"),
+            "adset_id":      i.get("adset_id"),
+            "adset_name":    i.get("adset_name"),
+            "reach":         safe_int(i.get("reach")),
+            "frequency":     safe_float(i.get("frequency")),
+            "impressions":   safe_int(i.get("impressions")),
+            "spend":         safe_float(i.get("spend")),
+            "cpp":           safe_float(i.get("cpp")),
+            "_ingested_at":  now_ts(),
+        } for i in ins]
+    return _run_per_account(accounts, one, "reach_frequency")
+
+
+def fetch_app_events(accounts):
+    log.info("Fetching App Events...")
+    def one(account):
+        ins = get_insights_async(account, level="account")
+        if ins is None: return None
+        out = []
+        for i in ins:
+            for action in i.get("actions", []):
+                at = action.get("action_type", "")
+                if "app" in at or "mobile" in at:
+                    out.append({
+                        "date":         i.get("date_start"),
+                        "account_id":   i.get("account_id"),
+                        "app_id":       "",
+                        "event_name":   at,
+                        "count":        safe_int(action.get("value")),
+                        "unique_users": None,
+                        "_ingested_at": now_ts(),
+                    })
+        return out
+    return _run_per_account(accounts, one, "app_events")
+
+
+def fetch_pixel_events(accounts):
+    log.info("Fetching Pixel Events...")
+    def one(account):
+        ins = get_insights_async(account, level="account")
+        if ins is None: return None
+        return [{
+            "date":         i.get("date_start"),
+            "account_id":   i.get("account_id"),
+            "event_name":   a.get("action_type"),
+            "count":        safe_int(a.get("value")),
+            "_ingested_at": now_ts(),
+        } for i in ins for a in i.get("actions", [])]
+    return _run_per_account(accounts, one, "pixel_events")
+
+# ─── STRUCTURE FETCHERS (campaigns / adsets / ads / creatives / audiences) ────
+def fetch_with_retry(fn, max_retries=5):
+    """Rate-limit pe exponential backoff. Fail pe raise karta hai (None nahi)."""
+    for attempt in range(max_retries):
+        try:
+            return list(fn())
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(w in err_str for w in ("rate", "too many", "limit reached")) or "2446079" in str(e):
+                wait = 120 * (attempt + 1)
+                log.warning(f"  Rate limit — {wait}s wait, retry {attempt+1}/{max_retries}...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"{max_retries} retries ke baad haar gaye")
 
 
 def fetch_campaigns(accounts):
@@ -847,117 +1198,96 @@ def fetch_campaigns(accounts):
         Campaign.Field.stop_time, Campaign.Field.created_time,
         Campaign.Field.updated_time,
     ]
-    rows = []
-    for account in accounts:
+    def one(account):
         time.sleep(2)
-        try:
-            campaigns = fetch_with_retry(
-                lambda: account.get_campaigns(fields=fields, params={"limit": 200})
-            )
-            for c in campaigns:
-                rows.append({
-                    "account_id":       account.get_id(),
-                    "campaign_id":      c.get("id"),
-                    "name":             c.get("name"),
-                    "status":           c.get("status"),
-                    "effective_status": c.get("effective_status"),
-                    "objective":        c.get("objective"),
-                    "buying_type":      c.get("buying_type"),
-                    "bid_strategy":     c.get("bid_strategy"),
-                    "daily_budget":     safe_float(c.get("daily_budget")),
-                    "lifetime_budget":  safe_float(c.get("lifetime_budget")),
-                    "budget_remaining": safe_float(c.get("budget_remaining")),
-                    "spend_cap":        safe_float(c.get("spend_cap")),
-                    "start_time":       parse_ts(c.get("start_time")),
-                    "stop_time":        parse_ts(c.get("stop_time")),
-                    "created_time":     parse_ts(c.get("created_time")),
-                    "updated_time":     parse_ts(c.get("updated_time")),
-                    "_ingested_at":     now_ts(),
-                })
-        except Exception as e:
-            log.warning(f"  Campaigns error for {account.get_id()}: {e}")
-    return rows
-
-
-def fetch_with_retry(fn, max_retries=5):
-    """Call fn() with exponential backoff on rate limit errors."""
-    for attempt in range(max_retries):
-        try:
-            return list(fn())
-        except Exception as e:
-            err_str = str(e)
-            if "rate" in err_str.lower() or "too many" in err_str.lower() or "limit reached" in err_str.lower() or "2446079" in err_str or "17" in err_str:
-                wait = 120 * (attempt + 1)
-                log.warning(f"  Rate limit — waiting {wait}s before retry {attempt+1}/{max_retries}...")
-                time.sleep(wait)
-            else:
-                raise e
-    log.warning(f"  Gave up after {max_retries} retries")
-    return []
+        campaigns = fetch_with_retry(
+            lambda: account.get_campaigns(fields=fields, params={"limit": 200}))
+        return [{
+            "account_id":       account.get_id(),
+            "campaign_id":      c.get("id"),
+            "name":             c.get("name"),
+            "status":           c.get("status"),
+            "effective_status": c.get("effective_status"),
+            "objective":        c.get("objective"),
+            "buying_type":      c.get("buying_type"),
+            "bid_strategy":     c.get("bid_strategy"),
+            "daily_budget":     safe_float(c.get("daily_budget")),
+            "lifetime_budget":  safe_float(c.get("lifetime_budget")),
+            "budget_remaining": safe_float(c.get("budget_remaining")),
+            "spend_cap":        safe_float(c.get("spend_cap")),
+            "start_time":       parse_ts(c.get("start_time")),
+            "stop_time":        parse_ts(c.get("stop_time")),
+            "created_time":     parse_ts(c.get("created_time")),
+            "updated_time":     parse_ts(c.get("updated_time")),
+            "_ingested_at":     now_ts(),
+        } for c in campaigns]
+    return _run_per_account(accounts, one, "campaigns")
 
 
 def fetch_adsets_for_account(account_id):
-    """Fetch all adsets for a single account using direct REST API with pagination."""
-    # UPDATED v2.1: Explicitly request object_store_url within promoted_object
-    fields = "id,campaign_id,name,status,effective_status,optimization_goal,billing_event,bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,promoted_object{application_id,object_store_url,pixel_id,custom_event_type},start_time,end_time,created_time,updated_time"
+    """
+    🛡️ v3: fail pe None (v2.1 adhoori list de deta tha, jo TRUNCATE ke saath
+       mil kar dimension rows uda deta tha).
+    """
+    fields = ("id,campaign_id,name,status,effective_status,optimization_goal,billing_event,"
+              "bid_strategy,bid_amount,daily_budget,lifetime_budget,targeting,"
+              "promoted_object{application_id,object_store_url,pixel_id,custom_event_type},"
+              "start_time,end_time,created_time,updated_time")
     url = f"https://graph.facebook.com/v18.0/{account_id}/adsets"
     all_adsets = []
-    first_params = {
-        "fields": fields,
-        "limit": 50,
-        "access_token": FB_ACCESS_TOKEN,
-    }
+    first_params = {"fields": fields, "limit": 50, "access_token": FB_ACCESS_TOKEN}
     page = 0
-    while url:
+    while url and page < 200:
         page += 1
         succeeded = False
         for attempt in range(5):
             try:
-                if page == 1:
-                    resp = requests.get(url, params=first_params).json()
-                else:
-                    resp = requests.get(url, params={"access_token": FB_ACCESS_TOKEN}).json()
+                resp = requests.get(
+                    url,
+                    params=first_params if page == 1 else {"access_token": FB_ACCESS_TOKEN},
+                    timeout=90,
+                ).json()
                 if "error" in resp:
                     err = resp["error"]
                     if err.get("code") in (17, 80000) or "rate" in str(err).lower() or "2446079" in str(err):
                         wait = 120 * (attempt + 1)
-                        log.warning(f"  Rate limit on adsets page {page} — waiting {wait}s...")
+                        log.warning(f"  Rate limit on adsets page {page} — {wait}s wait...")
                         time.sleep(wait)
                         continue
-                    else:
-                        log.warning(f"  Adset API error: {resp['error']}")
-                        return all_adsets
+                    log.warning(f"  Adset API error: {err}")
+                    return None                       # 🛡️ adhoori list NAHI
                 all_adsets.extend(resp.get("data", []))
-                log.info(f"  Got {len(resp.get('data', []))} adsets (page {page}, total {len(all_adsets)})")
+                log.info(f"  Got {len(resp.get('data', []))} adsets "
+                         f"(page {page}, total {len(all_adsets)})")
                 url = resp.get("paging", {}).get("next")
                 time.sleep(3)
                 succeeded = True
                 break
             except Exception as e:
                 log.warning(f"  Adset fetch error page {page}: {e}")
-                return all_adsets
+                return None                           # 🛡️ adhoori list NAHI
         if not succeeded:
-            log.warning(f"  Gave up on adsets after 5 retries on page {page}")
-            break
+            log.warning(f"  Adsets: page {page} pe 5 retries ke baad haar gaye")
+            return None                               # 🛡️ adhoori list NAHI
     return all_adsets
+
 
 def fetch_adsets(accounts):
     log.info("Fetching Ad Sets...")
-    rows = []
-    for account in accounts:
+    def one(account):
         time.sleep(30)
         log.info(f"  Fetching adsets for {account.get_id()}...")
         adsets = fetch_adsets_for_account(account.get_id())
+        if adsets is None:
+            return None
+        out = []
         for s in adsets:
             t   = s.get("targeting") or {}
             geo = t.get("geo_locations") or {}
             po  = s.get("promoted_object") or {}
-
-            # NEW v2.1: extract object_store_url and parse package/store_id
             store_url = po.get("object_store_url")
             android_pkg, apple_store_id = extract_package_from_store_url(store_url)
-
-            rows.append({
+            out.append({
                 "account_id":                   account.get_id(),
                 "adset_id":                     s.get("id"),
                 "campaign_id":                  s.get("campaign_id"),
@@ -978,7 +1308,6 @@ def fetch_adsets(accounts):
                 "placements_publisher_platforms": json.dumps(t.get("publisher_platforms", [])),
                 "promoted_object_app_id":         po.get("application_id"),
                 "promoted_object_pixel_id":       po.get("pixel_id"),
-                # NEW v2.1 fields:
                 "promoted_object_object_store_url":  store_url,
                 "promoted_object_android_package":   android_pkg,
                 "promoted_object_apple_app_store_id": apple_store_id,
@@ -988,7 +1317,8 @@ def fetch_adsets(accounts):
                 "updated_time":                 parse_ts(s.get("updated_time")),
                 "_ingested_at":                 now_ts(),
             })
-    return rows
+        return out
+    return _run_per_account(accounts, one, "adsets")
 
 
 def fetch_ads(accounts):
@@ -998,211 +1328,156 @@ def fetch_ads(accounts):
         Ad.Field.name, Ad.Field.status, Ad.Field.effective_status,
         Ad.Field.creative, Ad.Field.created_time, Ad.Field.updated_time,
     ]
-    rows = []
-    for account in accounts:
+    def one(account):
         time.sleep(2)
-        try:
-            ads = fetch_with_retry(
-                lambda: account.get_ads(fields=fields, params={"limit": 200})
-            )
-            for a in ads:
-                cr  = a.get("creative") or {}
-                oss = cr.get("object_story_spec") or {}
-                ld  = oss.get("link_data") or {}
-                rows.append({
-                    "account_id":               account.get_id(),
-                    "ad_id":                    a.get("id"),
-                    "adset_id":                 a.get("adset_id"),
-                    "campaign_id":              a.get("campaign_id"),
-                    "name":                     a.get("name"),
-                    "status":                   a.get("status"),
-                    "effective_status":         a.get("effective_status"),
-                    "creative_id":              cr.get("id"),
-                    "creative_title":           cr.get("title") or cr.get("name"),
-                    "creative_body":            cr.get("body") or ld.get("message"),
-                    "creative_call_to_action":  (ld.get("call_to_action") or {}).get("type"),
-                    "created_time":             parse_ts(a.get("created_time")),
-                    "updated_time":             parse_ts(a.get("updated_time")),
-                    "_ingested_at":             now_ts(),
-                })
-        except Exception as e:
-            log.warning(f"  Ads error for {account.get_id()}: {e}")
-    return rows
+        ads = fetch_with_retry(lambda: account.get_ads(fields=fields, params={"limit": 200}))
+        out = []
+        for a in ads:
+            cr  = a.get("creative") or {}
+            oss = cr.get("object_story_spec") or {}
+            ld  = oss.get("link_data") or {}
+            out.append({
+                "account_id":               account.get_id(),
+                "ad_id":                    a.get("id"),
+                "adset_id":                 a.get("adset_id"),
+                "campaign_id":              a.get("campaign_id"),
+                "name":                     a.get("name"),
+                "status":                   a.get("status"),
+                "effective_status":         a.get("effective_status"),
+                "creative_id":              cr.get("id"),
+                "creative_title":           cr.get("title") or cr.get("name"),
+                "creative_body":            cr.get("body") or ld.get("message"),
+                "creative_call_to_action":  (ld.get("call_to_action") or {}).get("type"),
+                "created_time":             parse_ts(a.get("created_time")),
+                "updated_time":             parse_ts(a.get("updated_time")),
+                "_ingested_at":             now_ts(),
+            })
+        return out
+    return _run_per_account(accounts, one, "ads")
 
 
 def fetch_ad_creatives(accounts):
     log.info("Fetching Ad Creatives...")
     fields = [
-        AdCreative.Field.id,
-        AdCreative.Field.name,
-        AdCreative.Field.title,
-        AdCreative.Field.body,
-        AdCreative.Field.call_to_action_type,
-        AdCreative.Field.image_url,
-        AdCreative.Field.thumbnail_url,
-        AdCreative.Field.video_id,
-        AdCreative.Field.link_url,
+        AdCreative.Field.id, AdCreative.Field.name, AdCreative.Field.title,
+        AdCreative.Field.body, AdCreative.Field.call_to_action_type,
+        AdCreative.Field.image_url, AdCreative.Field.thumbnail_url,
+        AdCreative.Field.video_id, AdCreative.Field.link_url,
         AdCreative.Field.effective_object_story_id,
     ]
-    rows = []
-    for account in accounts:
-        try:
-            for c in account.get_ad_creatives(fields=fields, params={"limit": 100}):
-                rows.append({
-                    "account_id":                account.get_id(),
-                    "creative_id":               c.get("id"),
-                    "name":                      c.get("name"),
-                    "title":                     c.get("title"),
-                    "body":                      c.get("body"),
-                    "call_to_action_type":       c.get("call_to_action_type"),
-                    "image_url":                 c.get("image_url"),
-                    "thumbnail_url":             c.get("thumbnail_url"),
-                    "video_id":                  c.get("video_id"),
-                    "link_url":                  c.get("link_url"),
-                    "effective_object_story_id": c.get("effective_object_story_id"),
-                    "_ingested_at":              now_ts(),
-                })
-        except Exception as e:
-            log.warning(f"  Creatives error for {account.get_id()}: {e}")
-    return rows
-
-
-def fetch_reach_frequency(accounts):
-    log.info("Fetching Reach & Frequency...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="adset",
-                                    extra_fields=[
-                                        AdsInsights.Field.campaign_name,
-                                        AdsInsights.Field.adset_name,
-                                    ]):
-            rows.append({
-                "date_start":    i.get("date_start"),
-                "account_id":    i.get("account_id"),
-                "campaign_id":   i.get("campaign_id"),
-                "campaign_name": i.get("campaign_name"),
-                "adset_id":      i.get("adset_id"),
-                "adset_name":    i.get("adset_name"),
-                "reach":         safe_int(i.get("reach")),
-                "frequency":     safe_float(i.get("frequency")),
-                "impressions":   safe_int(i.get("impressions")),
-                "spend":         safe_float(i.get("spend")),
-                "cpp":           safe_float(i.get("cpp")),
-                "_ingested_at":  now_ts(),
-            })
-    return rows
+    def one(account):
+        return [{
+            "account_id":                account.get_id(),
+            "creative_id":               c.get("id"),
+            "name":                      c.get("name"),
+            "title":                     c.get("title"),
+            "body":                      c.get("body"),
+            "call_to_action_type":       c.get("call_to_action_type"),
+            "image_url":                 c.get("image_url"),
+            "thumbnail_url":             c.get("thumbnail_url"),
+            "video_id":                  c.get("video_id"),
+            "link_url":                  c.get("link_url"),
+            "effective_object_story_id": c.get("effective_object_story_id"),
+            "_ingested_at":              now_ts(),
+        } for c in account.get_ad_creatives(fields=fields, params={"limit": 100})]
+    return _run_per_account(accounts, one, "ad_creatives")
 
 
 def fetch_auction_insights(accounts):
     log.info("Fetching Auction Insights...")
     start, end = date_range()
-    rows = []
-    for account in accounts:
-        try:
-            act_id = account.get_id()
-            resp = requests.get(
-                f"https://graph.facebook.com/v18.0/{act_id}/insights",
-                params={
-                    "level":          "adset",
-                    "time_range":     json.dumps({"since": start, "until": end}),
-                    "time_increment": 1,
-                    "fields":         "date_start,campaign_id,campaign_name,adset_id,adset_name,account_id",
-                    "limit":          500,
-                    "access_token":   FB_ACCESS_TOKEN,
-                }
-            ).json()
-            for i in resp.get("data", []):
-                rows.append({
-                    "date_start":          i.get("date_start"),
-                    "account_id":          i.get("account_id"),
-                    "campaign_id":         i.get("campaign_id"),
-                    "campaign_name":       i.get("campaign_name"),
-                    "adset_id":            i.get("adset_id"),
-                    "adset_name":          i.get("adset_name"),
-                    "impression_share":    None,
-                    "outranking_share":    None,
-                    "overlap_rate":        None,
-                    "position_above_rate": None,
-                    "_ingested_at":        now_ts(),
-                })
-        except Exception as e:
-            log.warning(f"  Auction insights error for {account.get_id()}: {e}")
-    return rows
+    def one(account):
+        resp = requests.get(
+            f"https://graph.facebook.com/v18.0/{account.get_id()}/insights",
+            params={
+                "level":          "adset",
+                "time_range":     json.dumps({"since": start, "until": end}),
+                "time_increment": 1,
+                "fields":         "date_start,campaign_id,campaign_name,adset_id,adset_name,account_id",
+                "limit":          500,
+                "access_token":   FB_ACCESS_TOKEN,
+            }, timeout=90,
+        ).json()
+        if "error" in resp:
+            log.warning(f"  Auction insights error: {resp['error']}")
+            return None
+        return [{
+            "date_start":          i.get("date_start"),
+            "account_id":          i.get("account_id"),
+            "campaign_id":         i.get("campaign_id"),
+            "campaign_name":       i.get("campaign_name"),
+            "adset_id":            i.get("adset_id"),
+            "adset_name":          i.get("adset_name"),
+            "impression_share":    None,
+            "outranking_share":    None,
+            "overlap_rate":        None,
+            "position_above_rate": None,
+            "_ingested_at":        now_ts(),
+        } for i in resp.get("data", [])]
+    return _run_per_account(accounts, one, "auction_insights")
 
 
-def fetch_app_events(accounts):
-    log.info("Fetching App Events...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="account"):
-            for action in i.get("actions", []):
-                action_type = action.get("action_type", "")
-                if "app" in action_type or "mobile" in action_type:
-                    rows.append({
-                        "date":         i.get("date_start"),
-                        "account_id":   i.get("account_id"),
-                        "app_id":       "",
-                        "event_name":   action_type,
-                        "count":        safe_int(action.get("value")),
-                        "unique_users": None,
-                        "_ingested_at": now_ts(),
-                    })
-    return rows
-
-
-def fetch_pixel_events(accounts):
-    log.info("Fetching Pixel Events...")
-    rows = []
-    for account in accounts:
-        for i in get_insights_async(account, level="account"):
-            for a in i.get("actions", []):
-                rows.append({
-                    "date":         i.get("date_start"),
-                    "account_id":   i.get("account_id"),
-                    "event_name":   a.get("action_type"),
-                    "count":        safe_int(a.get("value")),
-                    "_ingested_at": now_ts(),
-                })
-    return rows
+def fetch_custom_audiences(accounts):
+    log.info("Fetching Custom Audiences...")
+    fields = [
+        CustomAudience.Field.id, CustomAudience.Field.name,
+        CustomAudience.Field.subtype, CustomAudience.Field.approximate_count_lower_bound,
+        CustomAudience.Field.data_source, CustomAudience.Field.lookalike_spec,
+        CustomAudience.Field.retention_days, CustomAudience.Field.time_created,
+    ]
+    def one(account):
+        out = []
+        for a in account.get_custom_audiences(fields=fields, params={"limit": 200}):
+            try:
+                ds = a.get("data_source")
+                data_source_str = json.dumps(
+                    ds.export_all_data() if hasattr(ds, "export_all_data") else (ds or {}))
+            except Exception:
+                data_source_str = str(a.get("data_source", ""))
+            out.append({
+                "account_id":        account.get_id(),
+                "audience_id":       a.get("id"),
+                "name":              a.get("name"),
+                "subtype":           str(a.get("subtype", "")),
+                "approximate_count": safe_int(a.get("approximate_count_lower_bound")),
+                "data_source":       data_source_str,
+                "lookalike_spec":    json.dumps(a.get("lookalike_spec") or {}),
+                "retention_days":    safe_int(a.get("retention_days")),
+                "created_time":      parse_ts(str(a.get("time_created", ""))) if a.get("time_created") else None,
+                "_ingested_at":      now_ts(),
+            })
+        return out
+    return _run_per_account(accounts, one, "custom_audiences")
 
 
 def fetch_page_insights():
+    """Page insights account-scoped nahi — purana behaviour."""
     log.info("Fetching Page Insights...")
     if not FB_PAGE_ID:
         log.info("  No FB_PAGE_ID set, skipping")
-        return []
+        return [], None
 
     try:
         resp = requests.get(
             f"https://graph.facebook.com/v18.0/{FB_PAGE_ID}",
-            params={"fields": "access_token", "access_token": FB_ACCESS_TOKEN}
+            params={"fields": "access_token", "access_token": FB_ACCESS_TOKEN}, timeout=60
         ).json()
         page_token = resp.get("access_token", FB_ACCESS_TOKEN)
     except Exception as e:
         log.warning(f"  Could not get page token: {e}")
         page_token = FB_ACCESS_TOKEN
 
-    metrics = [
-        "page_impressions_unique",
-        "page_post_engagements",
-        "page_views_total",
-        "page_video_views",
-        "page_video_views_unique",
-        "page_total_actions",
-    ]
+    metrics = ["page_impressions_unique", "page_post_engagements", "page_views_total",
+               "page_video_views", "page_video_views_unique", "page_total_actions"]
     start, end = date_range()
     rows = []
 
-    page_api = FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, page_token, api_version="v18.0")
+    FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, page_token, api_version="v18.0")
     for metric in metrics:
         try:
             page = Page(FB_PAGE_ID)
             for m in page.get_insights(params={
-                "metric": metric,
-                "period": "day",
-                "since":  start,
-                "until":  end,
-            }):
+                    "metric": metric, "period": "day", "since": start, "until": end}):
                 for entry in m.get("values", []):
                     val = entry.get("value")
                     rows.append({
@@ -1218,66 +1493,20 @@ def fetch_page_insights():
 
     FacebookAdsApi.init(FB_APP_ID, FB_APP_SECRET, FB_ACCESS_TOKEN, api_version="v18.0")
     log.info(f"  Fetched {len(rows)} page insight rows")
-    return rows
-
-
-def fetch_custom_audiences(accounts):
-    log.info("Fetching Custom Audiences...")
-    fields = [
-        CustomAudience.Field.id,
-        CustomAudience.Field.name,
-        CustomAudience.Field.subtype,
-        CustomAudience.Field.approximate_count_lower_bound,
-        CustomAudience.Field.data_source,
-        CustomAudience.Field.lookalike_spec,
-        CustomAudience.Field.retention_days,
-        CustomAudience.Field.time_created,
-    ]
-    rows = []
-    for account in accounts:
-        try:
-            for a in account.get_custom_audiences(fields=fields, params={"limit": 200}):
-                try:
-                    ds = a.get("data_source")
-                    data_source_str = json.dumps(
-                        ds.export_all_data() if hasattr(ds, "export_all_data") else (ds or {})
-                    )
-                except Exception:
-                    data_source_str = str(a.get("data_source", ""))
-
-                rows.append({
-                    "account_id":        account.get_id(),
-                    "audience_id":       a.get("id"),
-                    "name":              a.get("name"),
-                    "subtype":           str(a.get("subtype", "")),
-                    "approximate_count": safe_int(a.get("approximate_count_lower_bound")),
-                    "data_source":       data_source_str,
-                    "lookalike_spec":    json.dumps(a.get("lookalike_spec") or {}),
-                    "retention_days":    safe_int(a.get("retention_days")),
-                    "created_time":      parse_ts(str(a.get("time_created", ""))) if a.get("time_created") else None,
-                    "_ingested_at":      now_ts(),
-                })
-        except Exception as e:
-            log.warning(f"  Custom audiences error for {account.get_id()}: {e}")
-    return rows
+    return rows, None
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery COMPLETE sync v2.1")
-    log.info(f"   Lookback: {LOOKBACK_DAYS} days | Business: {FB_BUSINESS_ID}")
+    log.info("🚀 Facebook → BigQuery sync v3.0")
+    log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
+    log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
+             f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
 
-    FacebookAdsApi.init(
-        app_id=FB_APP_ID,
-        app_secret=FB_APP_SECRET,
-        access_token=FB_ACCESS_TOKEN,
-        api_version="v18.0"
-    )
+    FacebookAdsApi.init(app_id=FB_APP_ID, app_secret=FB_APP_SECRET,
+                        access_token=FB_ACCESS_TOKEN, api_version="v18.0")
 
-    accounts = get_all_ad_accounts()
-    if not accounts:
-        log.error("No active ad accounts found!")
-        return
+    accounts = get_all_ad_accounts()          # khali list pe khud exit(1) karta hai
 
     bq = get_bq_client()
     ensure_dataset(bq)
@@ -1285,30 +1514,33 @@ def main():
         ensure_table(bq, t)
 
     log.info("── Account Level Insights ──")
-    load_to_bq(bq, "account_daily",             fetch_account_daily(accounts))
+    load_to_bq(bq, "account_daily",           fetch_account_daily(accounts))
 
     log.info("── Campaign Level Insights ──")
-    load_to_bq(bq, "campaign_daily_insights",   fetch_campaign_daily_insights(accounts))
+    load_to_bq(bq, "campaign_daily_insights", fetch_campaign_daily_insights(accounts))
 
     log.info("── Adset Level Insights ──")
-    load_to_bq(bq, "adset_daily_insights",      fetch_adset_daily_insights(accounts))
+    load_to_bq(bq, "adset_daily_insights",    fetch_adset_daily_insights(accounts))
 
     log.info("── Ad Level Insights ──")
-    load_to_bq(bq, "ad_insights_daily",         fetch_ad_insights_daily(accounts))
+    load_to_bq(bq, "ad_insights_daily",       fetch_ad_insights_daily(accounts))
 
     log.info("── Breakdown Insights ──")
     load_to_bq(bq, "ad_insights_by_country",
-               fetch_breakdown(accounts, "ad", ["country"], ["country"]))
+               fetch_breakdown(accounts, "ad", ["country"], ["country"],
+                               "ad_insights_by_country"))
     load_to_bq(bq, "ad_insights_by_device",
-               fetch_breakdown(accounts, "ad",
+               fetch_breakdown(accounts, "ad", ["device_platform", "impression_device"],
                                ["device_platform", "impression_device"],
-                               ["device_platform", "impression_device"]))
+                               "ad_insights_by_device"))
     load_to_bq(bq, "ad_insights_by_placement",
                fetch_breakdown(accounts, "ad",
                                ["publisher_platform", "platform_position", "impression_device"],
-                               ["publisher_platform", "platform_position", "impression_device"]))
+                               ["publisher_platform", "platform_position", "impression_device"],
+                               "ad_insights_by_placement"))
     load_to_bq(bq, "ad_insights_by_age_gender",
-               fetch_breakdown(accounts, "ad", ["age", "gender"], ["age", "gender"]))
+               fetch_breakdown(accounts, "ad", ["age", "gender"], ["age", "gender"],
+                               "ad_insights_by_age_gender"))
 
     log.info("── Campaign Structure ──")
     load_to_bq(bq, "campaigns",     fetch_campaigns(accounts))
@@ -1327,7 +1559,17 @@ def main():
     load_to_bq(bq, "page_insights",    fetch_page_insights())
     load_to_bq(bq, "custom_audiences", fetch_custom_audiences(accounts))
 
-    log.info("✅ Facebook sync v2.1 complete! 19 tables loaded.")
+    # ── 🛡️ BUG 6 KA FIX: exit code ab sach bolta hai ────────────────────────
+    if FAILURES:
+        log.error("=" * 70)
+        log.error(f"🔴 {len(FAILURES)} MASLE — run FAIL samjha jayega:")
+        for f in FAILURES:
+            log.error(f"   • {f}")
+        log.error("=" * 70)
+        log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
+        sys.exit(1)
+
+    log.info("✅ Facebook sync v3.0 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
