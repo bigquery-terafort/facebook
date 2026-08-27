@@ -1,21 +1,58 @@
 name: Facebook → BigQuery Sync
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  v3 CHANGES
+#  ──────────
+#   1. timeout-minutes: 60 → 180
+#      08-21 ka run 80% pe atka aur 60 min pe GitHub ne CANCEL kar diya.
+#      Ab script ke apne MAX_POLL_SECONDS guard ko kaam karne ka mauqa milta
+#      hai — wo account ko fail mark karke aage barhta hai (data uda nahi deta).
+#
+#   2. MAX_POLL_SECONDS / POLL_INTERVAL / ACTIVE_ONLY / ALLOW_TRUNCATE / DRY_RUN
+#      env vars — sab workflow_dispatch se control ho sakte hain.
+#
+#   3. keepalive job — GitHub 60 din tak koi commit na ho to scheduled
+#      workflows KHUD BAND kar deta hai. Isi ne pehle AdMob (~$27K) aur FX
+#      (30 din) kha liye the. Ab har mahine ek dummy commit ho jayega.
+#
+#   4. concurrency guard — do run ek saath na chalein (dono DELETE karenge).
+#
+#   5. "Notify on failure" ab asal mein FAIL karta hai (v2.1 mein sirf echo
+#      tha, jo exit 0 deta tha aur workflow green dikhta tha).
+# ═══════════════════════════════════════════════════════════════════════════
+
 on:
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       lookback_days:
-        description: "Days of data to pull (default: 30)"
+        description: "Days of data to pull"
         required: false
         default: "30"
+      dry_run:
+        description: "1 = fetch karo lekin BigQuery ko haath mat lagao"
+        required: false
+        default: "0"
+      active_only:
+        description: "1 = sirf status=active accounts (v2.1 wala behaviour — data loss ka khatra)"
+        required: false
+        default: "0"
+      allow_truncate:
+        description: "0 = dimension tables kabhi TRUNCATE na hon"
+        required: false
+        default: "1"
+
+# 🆕 v3: do run ek saath chalein to dono DELETE karenge — bacho.
+concurrency:
+  group: facebook-bigquery-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     name: Sync Facebook Data to BigQuery
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 180          # 🆕 v3: 60 → 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,8 +78,48 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET:           facebook_data
           LOOKBACK_DAYS:        ${{ github.event.inputs.lookback_days || '30' }}
+          # 🆕 v3 knobs
+          MAX_POLL_SECONDS:     "900"
+          POLL_INTERVAL:        "10"
+          ACTIVE_ONLY:          ${{ github.event.inputs.active_only    || '0' }}
+          ALLOW_TRUNCATE:       ${{ github.event.inputs.allow_truncate || '1' }}
+          DRY_RUN:              ${{ github.event.inputs.dry_run        || '0' }}
         run: python facebook_to_bigquery.py
 
-      - name: Notify on failure
+      # 🆕 v3: ab ye ASAL mein fail karta hai (v2.1 mein sirf echo tha)
+      - name: Fail loudly
         if: failure()
-        run: echo "❌ Facebook sync FAILED. Check logs above."
+        run: |
+          echo "::error::Facebook sync FAILED — upar ke logs mein 🔴 dhoondo."
+          echo "Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya."
+          exit 1
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 🆕 v3 — KEEPALIVE
+  # GitHub 60 din tak commit na hone pe scheduled workflows khud band kar deta
+  # hai (owner ko email jata hai jo aksar kisi ne nahi dekha). Isi ne pehle
+  # AdMob ~$27K aur FX ke 30 din khaye the — tareekhon se saabit:
+  #     fx_rate  aakhri commit Apr 26 + 60 = Jun 25 → data ruka Jun 26
+  #     admob ×3 aakhri commit May 20 + 60 = Jul 19 → data ruka Jul 19
+  # ═══════════════════════════════════════════════════════════════════════════
+  keepalive:
+    name: Keepalive (60-din auto-disable se bachao)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch repo (mahine mein ek baar)
+        run: |
+          # sirf mahine ki 1 tareekh ko
+          if [ "$(date -u +%d)" != "01" ]; then
+            echo "Aaj 1 tareekh nahi — skip"
+            exit 0
+          fi
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name  "keepalive-bot"
+          git config user.email "keepalive-bot@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "chore: keepalive [skip ci]" || exit 0
+          git push
