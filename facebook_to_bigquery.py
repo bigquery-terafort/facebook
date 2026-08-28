@@ -1,7 +1,7 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v3.0
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.1
 ===============================================
-v2.1 → v3.0 — DATA-LOSS FIXES
+v2.1 → v3.1 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -631,6 +631,36 @@ DATE_COL_MAP = {
 NO_ACCOUNT_TABLES = {"page_insights"}
 
 
+def _load_job(client, table_ref, rows, name, write_disposition):
+    """
+    🆕 v3.1 — streaming insert ki jagah LOAD JOB.
+
+    Load jobs:
+      · atomic (poora chalta hai ya bilkul nahi)
+      · streaming buffer use NAHI karte
+      · muft hain (streaming inserts paise lete hain)
+      · job.output_rows se tasdeeq ho jati hai
+
+    🛡️ BUG 7 KA FIX — TRUNCATE + streaming insert = KHAMOSH ROW LOSS
+       Saabit (2026-08-27 ka run):
+           adsets  log: 712 load   → table: 567   (−20%)
+           ads     log: 2,417 load → table: 2,010 (−17%)
+           account_daily (DELETE wala) 465 → 465   ✅ poora
+
+       BigQuery ka TRUNCATE streaming buffer ka metadata reset kar deta hai;
+       foran baad ke insert_rows_json rows bina koi error diye gir jate hain.
+       Ye bug v2.1 mein BHI tha — sirf kisi ne pakda nahi.
+    """
+    job_config = bigquery.LoadJobConfig(
+        schema=SCHEMAS[name],
+        write_disposition=write_disposition,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    job = client.load_table_from_json(rows, table_ref, job_config=job_config)
+    job.result()                      # error pe raise karta hai
+    return job.output_rows
+
+
 def load_to_bq(client, name, result):
     """
     🆕 v3 — DELETE ab account-scoped hai.
@@ -652,8 +682,10 @@ def load_to_bq(client, name, result):
 
     🛡️ BUG 2 KA FIX (yahan ka hissa):
        Agar ok_accounts KHALI hai to DELETE bilkul nahi hota — chahe rows
-       kitne bhi hon. Khali set ka matlab hai "kuch bhi bharose ke laaiq
-       fetch nahi hua".
+       kitne bhi hon.
+
+    🛡️ BUG 7 KA FIX (v3.1):
+       Load jobs — TRUNCATE+streaming wala 20% row loss khatam.
     """
     rows, ok_accounts = result if isinstance(result, tuple) else (result, None)
 
@@ -674,7 +706,7 @@ def load_to_bq(client, name, result):
     # ── DATE-BASED TABLES ───────────────────────────────────────────────────
     if date_col:
         if name in NO_ACCOUNT_TABLES:
-            # page_insights ka koi account_id nahi — purana behaviour
+            # page_insights ka koi account_id nahi
             try:
                 client.query(
                     f"DELETE FROM `{table_ref}` WHERE {date_col} BETWEEN '{start}' AND '{end}'"
@@ -690,7 +722,7 @@ def load_to_bq(client, name, result):
 
             ok_list = sorted(ok_accounts)
             try:
-                job = client.query(
+                client.query(
                     f"""
                     DELETE FROM `{table_ref}`
                     WHERE {date_col} BETWEEN @start AND @end
@@ -703,32 +735,28 @@ def load_to_bq(client, name, result):
                             bigquery.ArrayQueryParameter("ok", "STRING", ok_list),
                         ]
                     ),
-                )
-                job.result()
+                ).result()
                 log.info(f"  Cleared {name} ({start} → {end}) "
                          f"for {len(ok_list)} fetched accounts only")
             except Exception as e:
                 record_failure(f"delete[{name}]", e)
                 return
 
-    # ── DIMENSION TABLES (TRUNCATE) ─────────────────────────────────────────
+        write_mode = bigquery.WriteDisposition.WRITE_APPEND
+
+    # ── DIMENSION TABLES ────────────────────────────────────────────────────
     else:
-        # 🛡️ TRUNCATE tabhi jab HAR account kaamyab ho. Warna account-scoped
-        #    DELETE — taake kisi gire hue account ki dimension rows na uden.
-        #    (v2.1 mein yahan hamesha TRUNCATE tha — isi liye campaigns/adsets/
-        #     ads mein us account ki 0 rows bachi thin.)
         all_ok = ok_accounts is not None and len(ok_accounts) == len(ALL_DISCOVERED_ACCOUNTS)
 
         if ALLOW_TRUNCATE and all_ok:
-            try:
-                client.query(f"TRUNCATE TABLE `{table_ref}`").result()
-                log.info(f"  Truncated {name} (saare {len(ok_accounts)} accounts kaamyab)")
-            except Exception as e:
-                record_failure(f"truncate[{name}]", e)
-                return
+            # 🆕 v3.1: alag TRUNCATE nahi — load job khud WRITE_TRUNCATE karta hai.
+            #          Ye ATOMIC hai, aur streaming-buffer wala 20% loss nahi hota.
+            write_mode = bigquery.WriteDisposition.WRITE_TRUNCATE
+            log.info(f"  {name}: atomic replace (saare {len(ok_accounts)} accounts kaamyab)")
         else:
+            # 🛡️ Kuch account fail — sirf unhi ka data replace karo jo kaamyab hue.
             if not ok_accounts:
-                record_failure(name, "ok_accounts khali — TRUNCATE skip")
+                record_failure(name, "ok_accounts khali — replace skip")
                 return
             ok_list = sorted(ok_accounts)
             try:
@@ -741,33 +769,26 @@ def load_to_bq(client, name, result):
                         query_parameters=[bigquery.ArrayQueryParameter("ok", "STRING", ok_list)]
                     ),
                 ).result()
-                log.warning(f"  ⚠️  {name}: TRUNCATE nahi kiya "
+                log.warning(f"  ⚠️  {name}: poora replace nahi kiya "
                             f"({len(ok_list)}/{len(ALL_DISCOVERED_ACCOUNTS)} accounts kaamyab) — "
-                            f"sirf unhi ka data replace hua")
+                            f"fail hue accounts ka purana data MEHFOOZ hai")
             except Exception as e:
                 record_failure(f"delete[{name}]", e)
                 return
+            write_mode = bigquery.WriteDisposition.WRITE_APPEND
 
-    # ── LOAD ────────────────────────────────────────────────────────────────
-    BATCH_SIZE = 200
-    total_errors = []
-    failed_batches = 0
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i:i + BATCH_SIZE]
-        try:
-            errs = client.insert_rows_json(table_ref, batch)
-            if errs:
-                total_errors.extend(errs[:2])
-                failed_batches += 1
-        except Exception as e:
-            log.error(f"  Batch {i} failed: {e}")
-            failed_batches += 1
+    # ── LOAD (job — streaming nahi) ─────────────────────────────────────────
+    try:
+        loaded = _load_job(client, table_ref, rows, name, write_mode)
+    except Exception as e:
+        record_failure(f"load[{name}]", e)
+        return
 
-    if total_errors or failed_batches:
-        # 🛡️ BUG 6 KA FIX: DELETE ho chuka hai, load adhoora — ye SILENT nahi jayega.
-        record_failure(name, f"{failed_batches} batch fail, sample={total_errors[:1]}")
+    # 🛡️ Tasdeeq: jitne bheje, utne hi gaye?
+    if loaded != len(rows):
+        record_failure(name, f"row count mismatch — bheje {len(rows):,}, gaye {loaded:,}")
     else:
-        log.info(f"  ✅ {len(rows):,} rows → {name}")
+        log.info(f"  ✅ {loaded:,} rows → {name} (verified)")
 
 
 # ─── ACCOUNT DISCOVERY ───────────────────────────────────────────────────────
@@ -1498,7 +1519,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.0")
+    log.info("🚀 Facebook → BigQuery sync v3.1")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1569,7 +1590,7 @@ def main():
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
         sys.exit(1)
 
-    log.info("✅ Facebook sync v3.0 complete — 19 tables, koi masla nahi.")
+    log.info("✅ Facebook sync v3.1 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
