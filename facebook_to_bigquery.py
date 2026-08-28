@@ -1,7 +1,7 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v3.0
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.3
 ===============================================
-v2.1 → v3.0 — DATA-LOSS FIXES
+v2.1 → v3.3 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -836,11 +836,30 @@ def get_all_ad_accounts():
     global ALL_DISCOVERED_ACCOUNTS
     log.info(f"Discovering ad accounts from Business Manager {FB_BUSINESS_ID}...")
 
+    # 🛡️ BUG 9 KA FIX (v3.2) — ADHOORI DISCOVERY PE FORAN RUKO
+    #
+    #    Saabit (run #186, 2026-08-28 06:05):
+    #        ❌ account_discovery[owned]: 400 Client Error
+    #        → sirf 10 accounts mile (15 ki jagah)
+    #
+    #    v3.1 mein script aage barh jati thi. Khatra ye tha:
+    #        ALL_DISCOVERED_ACCOUNTS = 10
+    #        agar 10/10 kaamyab → all_ok = True
+    #        → campaigns/adsets/ads/ad_creatives/custom_audiences pe
+    #          WRITE_TRUNCATE → gayab 5 accounts ki dimension rows UR JATIN
+    #        (sirf adsets mein ~145 rows: 6+7+6+39+87)
+    #
+    #    Ab: koi bhi edge fail ho to BigQuery ko HAATH HI NA LAGE.
+    #    Insight tables to account-scoped DELETE se pehle hi mehfooz the,
+    #    lekin dimension tables ke liye POORI account list lazmi hai.
     all_accounts = []
+    discovery_failed = False
+
     try:
         all_accounts.extend(_collect_accounts("owned_ad_accounts"))
     except Exception as e:
         record_failure("account_discovery[owned]", e)
+        discovery_failed = True
 
     try:
         for a in _collect_accounts("client_ad_accounts"):
@@ -848,6 +867,17 @@ def get_all_ad_accounts():
                 all_accounts.append(a)
     except Exception as e:
         record_failure("account_discovery[client]", e)
+        discovery_failed = True
+
+    if discovery_failed:
+        log.error("=" * 70)
+        log.error("🔴 ACCOUNT DISCOVERY ADHOORI RAHI — BigQuery ko HAATH NAHI LAGAYA")
+        log.error(f"   Sirf {len(all_accounts)} accounts mile. Poori list ke bagair")
+        log.error("   dimension tables (campaigns/adsets/ads/creatives/audiences) ka")
+        log.error("   atomic replace gayab accounts ka data uda deta.")
+        log.error("   Ye aksar aarzi rate-limit hota hai — thodi der baad dobara chalao.")
+        log.error("=" * 70)
+        sys.exit(1)
 
     if not all_accounts:
         # 🛡️ BUG 6: khali list pe kabhi aage mat barho — warna sab kuch ur jayega.
@@ -1579,7 +1609,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.0")
+    log.info("🚀 Facebook → BigQuery sync v3.3")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1650,7 +1680,7 @@ def main():
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
         sys.exit(1)
 
-    log.info("✅ Facebook sync v3.0 complete — 19 tables, koi masla nahi.")
+    log.info("✅ Facebook sync v3.3 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
