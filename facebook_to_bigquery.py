@@ -1,7 +1,7 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v3.3
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.4
 ===============================================
-v2.1 → v3.3 — DATA-LOSS FIXES
+v2.1 → v3.4 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -795,18 +795,86 @@ def load_to_bq(client, name, result):
 ALL_DISCOVERED_ACCOUNTS = set()   # normalized ids — TRUNCATE guard iske saath compare karta hai
 
 
-def _fetch_account_page(url, params):
+# Facebook ke aarzi (transient) error codes — inpe retry karna chahiye
+TRANSIENT_CODES    = {1, 2, 4, 17, 32, 341, 613, 80000, 80004}
+TRANSIENT_SUBCODES = {99, 2446079}
+
+
+def _fetch_account_page(url, params, label="account_page"):
     """
     🛡️ BUG 4 KA FIX: v2.1 seedha `.json().get("data", [])` karta tha.
        API error (rate limit, token expiry) pe chup-chaap [] milta tha,
-       aur phir sab kuch DELETE ho jata tha. Ab error uthaya jata hai.
+       aur phir sab kuch DELETE ho jata tha.
+
+    🛡️ BUG 10 KA FIX (v3.4) — DISCOVERY PE RETRY + ASLI ERROR
+       Saabit (run #186 aur #187, 2026-08-28):
+           ❌ account_discovery[owned]: 400 Client Error ... owned_ad_accounts
+       Aur ye AARZI tha — 05:07 pe wahi call kaamyab thi, client_ad_accounts
+       dono baar theek chala. Yani rate limit.
+
+       v3.3 mein `raise_for_status()` error BODY padhne se PEHLE raise kar
+       deta tha — isliye Facebook ka asli code/subcode dikhta hi nahi tha,
+       aur retry ka koi mauqa nahi milta tha.
+
+       Ab:
+         · body hamesha parse hoti hai (status chahe kuch bhi ho)
+         · asli code/subcode/message log hota hai
+         · aarzi errors pe 5 retry + backoff (30s, 60s, 90s, 120s, 150s)
+         · sirf asli (permanent) error pe raise
     """
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    body = r.json()
-    if "error" in body:
-        raise RuntimeError(f"Facebook API error: {body['error']}")
-    return body
+    last_err = None
+    for attempt in range(5):
+        try:
+            r = requests.get(url, params=params, timeout=60)
+
+            # 🆕 body pehle padho — status chahe 400 ho ya 200
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+
+            err = body.get("error")
+            if err:
+                code    = err.get("code")
+                sub     = err.get("error_subcode")
+                message = err.get("message", "")
+                is_transient = (
+                    code in TRANSIENT_CODES
+                    or sub in TRANSIENT_SUBCODES
+                    or any(w in message.lower() for w in
+                           ("rate", "too many", "reduce the amount", "temporarily", "try again"))
+                )
+                if is_transient and attempt < 4:
+                    wait = 30 * (attempt + 1)
+                    log.warning(f"  {label}: aarzi error code={code}/{sub} — "
+                                f"{wait}s wait, retry {attempt+1}/5")
+                    log.warning(f"    FB message: {message[:200]}")
+                    time.sleep(wait)
+                    last_err = RuntimeError(f"code={code} sub={sub}: {message[:200]}")
+                    continue
+                # permanent — ya retries khatam
+                raise RuntimeError(
+                    f"Facebook API error (status {r.status_code}) "
+                    f"code={code} subcode={sub}: {message[:300]}")
+
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code} bina error body: {r.text[:300]}")
+
+            return body
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            # network / timeout — ye bhi aarzi hai
+            if attempt < 4:
+                wait = 30 * (attempt + 1)
+                log.warning(f"  {label}: network error — {wait}s wait, retry {attempt+1}/5: {e}")
+                time.sleep(wait)
+                last_err = e
+                continue
+            raise
+
+    raise RuntimeError(f"{label}: 5 retries ke baad haar gaye — {last_err}")
 
 
 def _collect_accounts(edge):
@@ -817,7 +885,10 @@ def _collect_accounts(edge):
     page = 0
     while url and page < 50:
         page += 1
-        body = _fetch_account_page(url, params if page == 1 else {"access_token": FB_ACCESS_TOKEN})
+        body = _fetch_account_page(
+            url,
+            params if page == 1 else {"access_token": FB_ACCESS_TOKEN},
+            label=f"{edge} page {page}")
         data = body.get("data", [])
         out.extend(data)
         log.info(f"  {edge} page {page}: {len(data)} accounts (total {len(out)})")
@@ -1609,7 +1680,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.3")
+    log.info("🚀 Facebook → BigQuery sync v3.4")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1680,7 +1751,7 @@ def main():
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
         sys.exit(1)
 
-    log.info("✅ Facebook sync v3.3 complete — 19 tables, koi masla nahi.")
+    log.info("✅ Facebook sync v3.4 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
