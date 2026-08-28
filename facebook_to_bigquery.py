@@ -1,7 +1,7 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v3.1
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.0
 ===============================================
-v2.1 → v3.1 — DATA-LOSS FIXES
+v2.1 → v3.0 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -1377,16 +1377,76 @@ def fetch_ads(accounts):
     return _run_per_account(accounts, one, "ads")
 
 
+def fetch_ad_creatives_for_account(account_id):
+    """
+    🆕 v3.2 — ad_creatives ab REST + apni pagination + retry se aata hai.
+
+    🛡️ BUG 8 KA FIX
+       v2.1 aur v3.1 dono mein `account.get_ad_creatives(...)` seedha SDK cursor
+       tha — na retry, na page-size control. Teen run mein teen baar toota:
+           run#183  act_1242798440606579  code 80004 (rate limit)
+           run#183  act_1737594613510482  code 1 "reduce the amount of data"
+           run#185  act_742591034622263   code 1/99 "unknown error"
+       Har baar pagination ke BEECH mein (cursor `after=...` ke saath), yani
+       aadhi list aa chuki hoti thi.
+
+       Ab:
+         · PAGE 25 (100 nahi) — "reduce the amount of data" isi se aata tha
+         · har page pe 5 retry + exponential backoff
+         · fail pe None (adhoori list NAHI) → us account ka purana data mehfooz
+    """
+    PAGE = int(os.environ.get("CREATIVES_PAGE_SIZE", "25"))
+    fields = ("id,name,title,body,call_to_action_type,image_url,thumbnail_url,"
+              "video_id,link_url,effective_object_story_id")
+    url = f"https://graph.facebook.com/v18.0/{account_id}/adcreatives"
+    out = []
+    first_params = {"fields": fields, "limit": PAGE, "access_token": FB_ACCESS_TOKEN}
+    page = 0
+    while url and page < 500:
+        page += 1
+        ok = False
+        for attempt in range(5):
+            try:
+                resp = requests.get(
+                    url,
+                    params=first_params if page == 1 else {"access_token": FB_ACCESS_TOKEN},
+                    timeout=90,
+                ).json()
+                if "error" in resp:
+                    err  = resp["error"]
+                    code = err.get("code")
+                    sub  = err.get("error_subcode")
+                    # rate limit ya "too much data" → wait karke phir se
+                    if code in (1, 2, 4, 17, 80000, 80004) or sub in (99, 2446079):
+                        wait = 60 * (attempt + 1)
+                        log.warning(f"  creatives page {page} — code={code}/{sub}, "
+                                    f"{wait}s wait, retry {attempt+1}/5 ({account_id})")
+                        time.sleep(wait)
+                        continue
+                    log.warning(f"  Creatives API error ({account_id}): {err}")
+                    return None                      # 🛡️ adhoori list NAHI
+                out.extend(resp.get("data", []))
+                url = resp.get("paging", {}).get("next")
+                time.sleep(2)
+                ok = True
+                break
+            except Exception as e:
+                log.warning(f"  Creatives fetch error page {page} ({account_id}): {e}")
+                time.sleep(30)
+        if not ok:
+            log.warning(f"  Creatives: page {page} pe 5 retries ke baad haar gaye ({account_id})")
+            return None                              # 🛡️ adhoori list NAHI
+    log.info(f"  Got {len(out)} creatives ({account_id}, {page} pages)")
+    return out
+
+
 def fetch_ad_creatives(accounts):
     log.info("Fetching Ad Creatives...")
-    fields = [
-        AdCreative.Field.id, AdCreative.Field.name, AdCreative.Field.title,
-        AdCreative.Field.body, AdCreative.Field.call_to_action_type,
-        AdCreative.Field.image_url, AdCreative.Field.thumbnail_url,
-        AdCreative.Field.video_id, AdCreative.Field.link_url,
-        AdCreative.Field.effective_object_story_id,
-    ]
     def one(account):
+        time.sleep(5)
+        creatives = fetch_ad_creatives_for_account(account.get_id())
+        if creatives is None:
+            return None
         return [{
             "account_id":                account.get_id(),
             "creative_id":               c.get("id"),
@@ -1400,7 +1460,7 @@ def fetch_ad_creatives(accounts):
             "link_url":                  c.get("link_url"),
             "effective_object_story_id": c.get("effective_object_story_id"),
             "_ingested_at":              now_ts(),
-        } for c in account.get_ad_creatives(fields=fields, params={"limit": 100})]
+        } for c in creatives]
     return _run_per_account(accounts, one, "ad_creatives")
 
 
@@ -1519,7 +1579,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.1")
+    log.info("🚀 Facebook → BigQuery sync v3.0")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1590,7 +1650,7 @@ def main():
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
         sys.exit(1)
 
-    log.info("✅ Facebook sync v3.1 complete — 19 tables, koi masla nahi.")
+    log.info("✅ Facebook sync v3.0 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
