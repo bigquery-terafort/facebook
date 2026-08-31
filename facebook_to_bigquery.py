@@ -1,7 +1,7 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v3.4
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.5
 ===============================================
-v2.1 → v3.4 — DATA-LOSS FIXES
+v2.1 → v3.5 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -482,6 +482,38 @@ def parse_ts(ts):
     ts = re.sub(r'[+-]\d{4}$', '', ts).strip()
     ts = re.sub(r'[+-]\d{2}:\d{2}$', '', ts).strip()
     return ts
+
+def safe_json(v):
+    """
+    Facebook SDK ke objects (LookalikeSpec, DataSource, TargetingSpec...) ko
+    JSON string mein badalta hai.
+
+    🛡️ BUG 11 KA FIX (run #192, 2026-08-30)
+       ❌ custom_audiences[497697311952893]:
+          Object of type LookalikeSpec is not JSON serializable
+
+       v3.4 mein `data_source` ke liye try/except tha lekin `lookalike_spec`
+       ke liye NAHI — aur wahi crash kar gaya. Ab dono (aur koi bhi aisa
+       field) isi helper se guzarte hain.
+
+       Fail hone pe bhi NAHI girta: aakhri chara `str(v)` hai. Ek field ki
+       shakl ki wajah se poore account ka data kho dena bewaqoofi hoti.
+    """
+    if v is None:
+        return "{}"
+    try:
+        if hasattr(v, "export_all_data"):
+            return json.dumps(v.export_all_data())
+        return json.dumps(v)
+    except (TypeError, ValueError):
+        pass
+    # dict/list ke andar bhi SDK objects ho sakte hain — ek ek karke
+    try:
+        return json.dumps(v, default=lambda o: (
+            o.export_all_data() if hasattr(o, "export_all_data") else str(o)))
+    except (TypeError, ValueError):
+        return json.dumps({"_unserializable": str(v)[:1000]})
+
 
 def norm_acct(acct_id):
     """`act_123` aur `123` ko ek hi shakl mein laata hai.
@@ -1425,9 +1457,10 @@ def fetch_adsets(accounts):
                 "targeting_countries":          ",".join(geo.get("countries", [])),
                 "targeting_age_min":            safe_int(t.get("age_min")),
                 "targeting_age_max":            safe_int(t.get("age_max")),
-                "targeting_genders":            json.dumps(t.get("genders", [])),
-                "targeting_custom_audiences":   json.dumps([a.get("id") for a in t.get("custom_audiences", [])]),
-                "placements_publisher_platforms": json.dumps(t.get("publisher_platforms", [])),
+                # 🛡️ BUG 11: targeting mein bhi SDK objects aa sakte hain
+                "targeting_genders":            safe_json(t.get("genders", [])),
+                "targeting_custom_audiences":   safe_json([a.get("id") for a in t.get("custom_audiences", [])]),
+                "placements_publisher_platforms": safe_json(t.get("publisher_platforms", [])),
                 "promoted_object_app_id":         po.get("application_id"),
                 "promoted_object_pixel_id":       po.get("pixel_id"),
                 "promoted_object_object_store_url":  store_url,
@@ -1610,20 +1643,15 @@ def fetch_custom_audiences(accounts):
     def one(account):
         out = []
         for a in account.get_custom_audiences(fields=fields, params={"limit": 200}):
-            try:
-                ds = a.get("data_source")
-                data_source_str = json.dumps(
-                    ds.export_all_data() if hasattr(ds, "export_all_data") else (ds or {}))
-            except Exception:
-                data_source_str = str(a.get("data_source", ""))
+            # 🛡️ BUG 11: har SDK object safe_json se guzarta hai
             out.append({
                 "account_id":        account.get_id(),
                 "audience_id":       a.get("id"),
                 "name":              a.get("name"),
                 "subtype":           str(a.get("subtype", "")),
                 "approximate_count": safe_int(a.get("approximate_count_lower_bound")),
-                "data_source":       data_source_str,
-                "lookalike_spec":    json.dumps(a.get("lookalike_spec") or {}),
+                "data_source":       safe_json(a.get("data_source")),
+                "lookalike_spec":    safe_json(a.get("lookalike_spec")),
                 "retention_days":    safe_int(a.get("retention_days")),
                 "created_time":      parse_ts(str(a.get("time_created", ""))) if a.get("time_created") else None,
                 "_ingested_at":      now_ts(),
@@ -1680,7 +1708,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.4")
+    log.info("🚀 Facebook → BigQuery sync v3.5")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1751,7 +1779,7 @@ def main():
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
         sys.exit(1)
 
-    log.info("✅ Facebook sync v3.4 complete — 19 tables, koi masla nahi.")
+    log.info("✅ Facebook sync v3.5 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
