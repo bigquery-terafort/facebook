@@ -1,7 +1,7 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v3.5
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.7
 ===============================================
-v2.1 → v3.5 — DATA-LOSS FIXES
+v2.1 → v3.7 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -117,9 +117,43 @@ DRY_RUN          = os.environ.get("DRY_RUN", "0") == "1"
 # 🆕 v3 — poore run ka sehat-nama. Koi bhi entry = exit(1).
 FAILURES = []
 
+# 🆕 v3.6 — NARM nakami: sirf `ad_creatives` ke liye.
+#
+#    KYUN ALAG
+#    ─────────
+#    ad_creatives DIMENSION data hai — ad ka title/body/image. Us mein
+#    revenue ya spend ka ek paisa nahi. Do accounts (jinke 5,360 aur 1,300
+#    creatives hain) pagination ke beech rate-limit se toot jate hain, jabke
+#    baqi 18 tables — SAARA revenue aur spend — bilkul theek aate hain.
+#
+#    Agar is ek dimension table ki wajah se poora run LAL kar dein, to log
+#    LAL run ko nazarandaz karna seekh jate hain — aur phir asli masla bhi
+#    chhup jata hai. Yehi wo aadat hai jis se pehle ~$27K AdMob ka nuqsan hua.
+#
+#    Isliye: ad_creatives fail ho to LOUD warning + alag ginti, magar run
+#    RED nahi hota — BASHARTE ke us account ka purana data mehfooz ho
+#    (guard wo pehle se karta hai: fail account ka DELETE hota hi nahi).
+#
+#    Sakht chahiye to: CREATIVES_STRICT=1
+SOFT_FAILURES = []
+CREATIVES_STRICT = os.environ.get("CREATIVES_STRICT", "0") == "1"
+
+
 def record_failure(where, detail):
     """Har masla yahan darj hota hai. Aakhir mein exit code tay karta hai."""
     msg = f"{where}: {detail}"
+    # 🛡️ BUG A KA FIX (v3.7) — NARM sirf FETCH ki nakami pe.
+    #    _run_per_account() ka label "ad_creatives[<account_id>]" hota hai —
+    #    bracket lazmi hai. Is se ye HARD rehte hain (aur rehne chahiyen):
+    #        "ad_creatives"          → load_to_bq ka row-count mismatch
+    #                                  (BUG 7 wali khamosh row-loss; DELETE
+    #                                   ho chuka hota hai, table ab GALAT hai)
+    #        "load[ad_creatives]"    → load job fail
+    #        "delete[ad_creatives]"  → DELETE fail
+    if where.startswith("ad_creatives[") and not CREATIVES_STRICT:
+        SOFT_FAILURES.append(msg)
+        log.warning(f"  ⚠️  {msg}  (dimension data — run RED nahi hoga)")
+        return
     FAILURES.append(msg)
     log.error(f"  ❌ {msg}")
 
@@ -1391,7 +1425,8 @@ def fetch_adsets_for_account(account_id):
     all_adsets = []
     first_params = {"fields": fields, "limit": 50, "access_token": FB_ACCESS_TOKEN}
     page = 0
-    while url and page < 200:
+    ADSET_MAX_PAGES = int(os.environ.get("ADSET_MAX_PAGES", "1000"))
+    while url and page < ADSET_MAX_PAGES:
         page += 1
         succeeded = False
         for attempt in range(5):
@@ -1423,6 +1458,13 @@ def fetch_adsets_for_account(account_id):
         if not succeeded:
             log.warning(f"  Adsets: page {page} pe 5 retries ke baad haar gaye")
             return None                               # 🛡️ adhoori list NAHI
+
+    # 🛡️ BUG B KA FIX (v3.7) — yahan bhi wahi khamosh truncation thi
+    if url:
+        log.warning(f"  Adsets: {ADSET_MAX_PAGES} page cap laga lekin AUR data baqi tha "
+                    f"({account_id}) — adhoori list NAHI bhejenge")
+        return None
+
     return all_adsets
 
 
@@ -1529,17 +1571,35 @@ def fetch_ad_creatives_for_account(account_id):
          · har page pe 5 retry + exponential backoff
          · fail pe None (adhoori list NAHI) → us account ka purana data mehfooz
     """
-    PAGE = int(os.environ.get("CREATIVES_PAGE_SIZE", "25"))
+    # v3.6: 25 -> 10. Jin 2 accounts ke sab se zyada creatives hain (5,360
+    #       aur 1,300) wahi toot rahe the — chhota page rate limit se bachata hai.
+    PAGE       = int(os.environ.get("CREATIVES_PAGE_SIZE", "10"))
+    PAGE_SLEEP = float(os.environ.get("CREATIVES_PAGE_SLEEP", "3"))
+    RETRIES    = int(os.environ.get("CREATIVES_RETRIES", "4"))
+    MAX_PAGES  = int(os.environ.get("CREATIVES_MAX_PAGES", "5000"))
+    # 🛡️ BUG C KA FIX (v3.7) — har account ka WAQT KA BUDGET.
+    #    Bina is ke: 8 retries × 90..600s = ~51 min PER PAGE. Do accounts
+    #    fail = ~100 min extra. Pichhla run 137 min tha, YAML timeout 180 —
+    #    yani GitHub run ko BEECH MEIN maar deta aur haalat pehle se KHARAB
+    #    ho jati. Ab account 12 min se zyada nahi lega.
+    BUDGET     = int(os.environ.get("CREATIVES_ACCOUNT_BUDGET", "720"))
+    t0         = time.time()
     fields = ("id,name,title,body,call_to_action_type,image_url,thumbnail_url,"
               "video_id,link_url,effective_object_story_id")
     url = f"https://graph.facebook.com/v18.0/{account_id}/adcreatives"
     out = []
     first_params = {"fields": fields, "limit": PAGE, "access_token": FB_ACCESS_TOKEN}
     page = 0
-    while url and page < 500:
+    while url and page < MAX_PAGES:
+        # 🛡️ BUG C: budget khatam? adhoori list NAHI — saaf nakami.
+        if time.time() - t0 > BUDGET:
+            log.warning(f"  Creatives: {BUDGET}s ka budget khatam ({account_id}) — "
+                        f"{len(out)} mile the, magar adhoori list NAHI bhejenge "
+                        f"(purana data mehfooz rahega)")
+            return None
         page += 1
         ok = False
-        for attempt in range(5):
+        for attempt in range(RETRIES):
             try:
                 resp = requests.get(
                     url,
@@ -1551,26 +1611,39 @@ def fetch_ad_creatives_for_account(account_id):
                     code = err.get("code")
                     sub  = err.get("error_subcode")
                     # rate limit ya "too much data" → wait karke phir se
-                    if code in (1, 2, 4, 17, 80000, 80004) or sub in (99, 2446079):
-                        wait = 60 * (attempt + 1)
+                    if code in (1, 2, 4, 17, 32, 80000, 80004) or sub in (99, 2446079):
+                        # v3.6: 60s -> 90s, aur 8 tak retries (kul ~30 min sabr)
+                        wait = min(60 * (attempt + 1), 240)
                         log.warning(f"  creatives page {page} — code={code}/{sub}, "
-                                    f"{wait}s wait, retry {attempt+1}/5 ({account_id})")
+                                    f"{wait}s wait, retry {attempt+1}/{RETRIES} ({account_id})")
                         time.sleep(wait)
                         continue
                     log.warning(f"  Creatives API error ({account_id}): {err}")
                     return None                      # 🛡️ adhoori list NAHI
                 out.extend(resp.get("data", []))
                 url = resp.get("paging", {}).get("next")
-                time.sleep(2)
+                time.sleep(PAGE_SLEEP)
                 ok = True
                 break
             except Exception as e:
                 log.warning(f"  Creatives fetch error page {page} ({account_id}): {e}")
                 time.sleep(30)
         if not ok:
-            log.warning(f"  Creatives: page {page} pe 5 retries ke baad haar gaye ({account_id})")
+            log.warning(f"  Creatives: page {page} pe {RETRIES} retries ke baad haar gaye "
+                        f"({account_id}) — {len(out)} creatives mil chuke the, "
+                        f"magar adhoori list NAHI bhejenge (purana data mehfooz rahega)")
             return None                              # 🛡️ adhoori list NAHI
-    log.info(f"  Got {len(out)} creatives ({account_id}, {page} pages)")
+
+    # 🛡️ BUG B KA FIX (v3.7) — page cap laga aur ABHI BHI aage data tha?
+    #    Purana code yahan `out` (adhoori list) KAAMYABI samajh kar lauta deta
+    #    tha — yani chup-chaap kat jati. Ab saaf nakami.
+    if url:
+        log.warning(f"  Creatives: {MAX_PAGES} page cap laga lekin AUR data baqi tha "
+                    f"({account_id}) — adhoori list NAHI bhejenge")
+        return None
+
+    log.info(f"  Got {len(out)} creatives ({account_id}, {page} pages, "
+             f"{int(time.time()-t0)}s)")
     return out
 
 
@@ -1708,7 +1781,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.5")
+    log.info("🚀 Facebook → BigQuery sync v3.7")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1770,6 +1843,16 @@ def main():
     load_to_bq(bq, "custom_audiences", fetch_custom_audiences(accounts))
 
     # ── 🛡️ BUG 6 KA FIX: exit code ab sach bolta hai ────────────────────────
+    if SOFT_FAILURES:
+        log.warning("=" * 70)
+        log.warning("⚠️  %d NARM masle (dimension data — run RED nahi hoga):",
+                    len(SOFT_FAILURES))
+        for f in SOFT_FAILURES:
+            log.warning("   • %s", f)
+        log.warning("   In accounts ka PURANA creatives data mehfooz hai.")
+        log.warning("   Sakht chahiye to CREATIVES_STRICT=1 set karo.")
+        log.warning("=" * 70)
+
     if FAILURES:
         log.error("=" * 70)
         log.error(f"🔴 {len(FAILURES)} MASLE — run FAIL samjha jayega:")
@@ -1779,7 +1862,11 @@ def main():
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
         sys.exit(1)
 
-    log.info("✅ Facebook sync v3.5 complete — 19 tables, koi masla nahi.")
+    if SOFT_FAILURES:
+        log.info("✅ Facebook sync v3.7 — revenue/spend ke saarey tables theek. "
+                 "(%d dimension warning upar)", len(SOFT_FAILURES))
+    else:
+        log.info("✅ Facebook sync v3.7 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
