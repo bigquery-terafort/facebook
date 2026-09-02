@@ -1,7 +1,7 @@
 """
 Facebook → BigQuery  ·  COMPLETE PIPELINE v3.8
 ===============================================
-v2.1 → v3.8 — DATA-LOSS FIXES
+v2.1 → v3.9 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -138,7 +138,31 @@ FAILURES = []
 SOFT_FAILURES = []
 CREATIVES_STRICT = os.environ.get("CREATIVES_STRICT", "0") == "1"
 
-# 🛡️ v3.8 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
+# ══════════════════════════════════════════════════════════════════════════
+#  🆕 v3.9 — GITHUB ANNOTATIONS
+#  ────────────────────────────
+#  Masla: run FAIL hone par wajah SIRF log ke andar hoti hai. GitHub ka
+#  "Annotations" box (jo page ke upar dikhta hai) usay nahi dikhata, kyunki
+#  Python ka log.error() sirf saada text hai.
+#
+#  Natija: fail hone par banda log kholay, neeche scroll karay, dhoonday...
+#          aur akser wo mil hi nahi pata.
+#
+#  Hal: GitHub `::error::` aur `::warning::` likhne par UPAR box mein
+#       dikhata hai — bina log khole. Ab har failure wahan aayega.
+#
+#  Docs: https://docs.github.com/actions/reference/workflow-commands
+# ══════════════════════════════════════════════════════════════════════════
+IN_GHA = os.environ.get("GITHUB_ACTIONS") == "true"
+
+def gha(kind: str, msg: str) -> None:
+    """GitHub Actions ke Annotations box mein likho (fail par foran nazar aaye)."""
+    if not IN_GHA:
+        return
+    clean = str(msg).replace("\r", " ").replace("\n", " ")[:900]
+    print(f"::{kind}::{clean}", flush=True)
+
+# 🛡️ v3.9 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
 #    Default 25 min. Is se run kabhi bhi creatives par nahi atkega.
 #    list isliye taake nested function bina `global` ke padh sake.
 CREATIVES_TOTAL_BUDGET = int(os.environ.get("CREATIVES_TOTAL_BUDGET", "1500"))
@@ -159,9 +183,11 @@ def record_failure(where, detail):
     if where.startswith("ad_creatives[") and not CREATIVES_STRICT:
         SOFT_FAILURES.append(msg)
         log.warning(f"  ⚠️  {msg}  (dimension data — run RED nahi hoga)")
+        gha("warning", f"FB sync (narm): {msg}")   # 🆕 v3.9
         return
     FAILURES.append(msg)
     log.error(f"  ❌ {msg}")
+    gha("error", f"FB sync: {msg}")     # 🆕 v3.9 — Annotations box mein bhi
 
 # ─── ACTION TYPES ────────────────────────────────────────────────────────────
 INSTALL_ACTIONS  = {"mobile_app_install", "app_install"}
@@ -1579,7 +1605,7 @@ def fetch_ad_creatives_for_account(account_id):
     """
     # v3.6: 25 -> 10. Jin 2 accounts ke sab se zyada creatives hain (5,360
     #       aur 1,300) wahi toot rahe the — chhota page rate limit se bachata hai.
-    # 🛡️ v3.8 — RUN #196 KA SABAQ
+    # 🛡️ v3.9 — RUN #196 KA SABAQ
     #    v3.7 mein 720s ka PER-ACCOUNT budget tha. 15 accounts × 12 min = 180 min
     #    — theek workflow timeout jitna. Run #196 3h par CANCEL hua aur
     #    Auction Insights / Custom Audiences / Page Insights chale hi nahi.
@@ -1839,7 +1865,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.8")
+    log.info("🚀 Facebook → BigQuery sync v3.9")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1931,6 +1957,8 @@ def main():
         log.warning("   In accounts ka PURANA creatives data mehfooz hai.")
         log.warning("   Sakht chahiye to CREATIVES_STRICT=1 set karo.")
         log.warning("=" * 70)
+        gha("warning", f"FB sync — {len(SOFT_FAILURES)} narm masle (dimension data): "
+                       + " | ".join(SOFT_FAILURES))
 
     if FAILURES:
         log.error("=" * 70)
@@ -1939,13 +1967,17 @@ def main():
             log.error(f"   • {f}")
         log.error("=" * 70)
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
+
+        # 🆕 v3.9 — poori wajah UPAR Annotations box mein, ek hi jagah.
+        #    Ab log kholne ki zaroorat nahi — page ke upar hi dikh jayega.
+        gha("error", f"FB sync FAIL — {len(FAILURES)} masle: " + " | ".join(FAILURES))
         sys.exit(1)
 
     if SOFT_FAILURES:
-        log.info("✅ Facebook sync v3.8 — revenue/spend ke saarey tables theek. "
+        log.info("✅ Facebook sync v3.9 — revenue/spend ke saarey tables theek. "
                  "(%d dimension warning upar)", len(SOFT_FAILURES))
     else:
-        log.info("✅ Facebook sync v3.8 complete — 19 tables, koi masla nahi.")
+        log.info("✅ Facebook sync v3.9 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
