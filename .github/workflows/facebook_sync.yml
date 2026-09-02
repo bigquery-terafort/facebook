@@ -19,6 +19,34 @@ name: Facebook → BigQuery Sync
 #
 #   5. "Notify on failure" ab asal mein FAIL karta hai (v2.1 mein sirf echo
 #      tha, jo exit 0 deta tha aur workflow green dikhta tha).
+#
+# ═══════════════════════════════════════════════════════════════════════════
+#  🆕 v4 CHANGES  (2026-09-02) — 120-DIN BACKFILL KE LIYE
+#  ─────────────────────────────────────────────────────
+#   6. timeout-minutes: 180 → 240
+#      Run #196 THEEK 180 min par CANCEL hua tha. 120-din ke backfill mein
+#      insights ka hissa bohot barhega, is liye gunjaish chahiye.
+#      (GitHub-hosted runner ki hard limit 6 ghante = 360 min hai.)
+#
+#   7. 🔴 MAX_POLL_SECONDS ab HARDCODED NAHI — dispatch input ban gaya.
+#      PEHLE: MAX_POLL_SECONDS: "900"  ← YAML edit ke bagair badla hi nahi ja sakta tha
+#
+#      Ye HAR async insights job par alag lagta hai. 120 din ka data
+#      Facebook ke andar process hone mein 15 min se zyada le sakta hai —
+#      aur timeout hone par:
+#          return None → record_failure → run RED
+#          us account ka PURANA data mehfooz rehta hai (guard theek hai)
+#          magar NAYA data aata hi nahi
+#
+#      Backfill ke liye 2400 (40 min) do. Rozana run ke liye 900 hi theek hai.
+#
+#   8. ad_creatives ke knobs (v3.8/v3.9 mein bane, YAML mein the hi nahi):
+#      Run #196 creatives par 173 min kha kar 3 ghante pe CANCEL hua tha.
+#      Ab poore phase ka waqt ka budget hai. Run #199 mein 19 min laga.
+#
+#      CREATIVES_ACCOUNT_BUDGET=180 se 4 bare accounts poore nahi hue.
+#      BQ ke aankdon se: unhe 191s / 208s / 214s / 633s chahiyen the.
+#      Is liye default ab 700 (phase budget 2400 ke saath).
 # ═══════════════════════════════════════════════════════════════════════════
 
 on:
@@ -30,6 +58,18 @@ on:
         description: "Days of data to pull"
         required: false
         default: "30"
+      max_poll_seconds:
+        description: "🆕 Ek async insights job kitni der poll ho (rozana 900 · 120-din backfill 2400)"
+        required: false
+        default: "900"
+      creatives_total_budget:
+        description: "🆕 POORE ad_creatives phase ki hadd, seconds (default 2400 = 40 min)"
+        required: false
+        default: "2400"
+      creatives_account_budget:
+        description: "🆕 Ek account ke creatives ki hadd, seconds (default 700)"
+        required: false
+        default: "700"
       dry_run:
         description: "1 = fetch karo lekin BigQuery ko haath mat lagao"
         required: false
@@ -52,7 +92,7 @@ jobs:
   sync:
     name: Sync Facebook Data to BigQuery
     runs-on: ubuntu-latest
-    timeout-minutes: 180          # 🆕 v3: 60 → 180
+    timeout-minutes: 240          # 🆕 v4: 180 → 240 (GitHub ki hadd 360)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,14 +119,25 @@ jobs:
           BQ_DATASET:           facebook_data
           LOOKBACK_DAYS:        ${{ github.event.inputs.lookback_days || '30' }}
           # 🆕 v3 knobs
-          MAX_POLL_SECONDS:     "900"
+          # 🆕 v4: MAX_POLL_SECONDS ab dispatch se aata hai (pehle "900" hardcoded tha)
+          MAX_POLL_SECONDS:     ${{ github.event.inputs.max_poll_seconds || '900' }}
           POLL_INTERVAL:        "10"
           ACTIVE_ONLY:          ${{ github.event.inputs.active_only    || '0' }}
           ALLOW_TRUNCATE:       ${{ github.event.inputs.allow_truncate || '1' }}
           DRY_RUN:              ${{ github.event.inputs.dry_run        || '0' }}
+          # 🆕 v4: ad_creatives ke waqt ke budget (v3.8/v3.9 se)
+          #    creatives SAB SE AAKHIR mein chalte hain, is liye ye kisi
+          #    revenue/spend table ko rok nahi sakte.
+          CREATIVES_TOTAL_BUDGET:   ${{ github.event.inputs.creatives_total_budget   || '2400' }}
+          CREATIVES_ACCOUNT_BUDGET: ${{ github.event.inputs.creatives_account_budget || '700' }}
+          CREATIVES_PAGE_SIZE:      "25"
+          CREATIVES_HTTP_TIMEOUT:   "45"
+          CREATIVES_STRICT:         "0"
         run: python facebook_to_bigquery.py
 
       # 🆕 v3: ab ye ASAL mein fail karta hai (v2.1 mein sirf echo tha)
+      #    v3.9 se script khud bhi ::error:: deti hai (Annotations box mein),
+      #    ye us ke ilawa ek catch-all hai.
       - name: Fail loudly
         if: failure()
         run: |
