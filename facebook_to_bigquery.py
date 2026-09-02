@@ -1,7 +1,7 @@
 """
-Facebook → BigQuery  ·  COMPLETE PIPELINE v3.7
+Facebook → BigQuery  ·  COMPLETE PIPELINE v3.8
 ===============================================
-v2.1 → v3.7 — DATA-LOSS FIXES
+v2.1 → v3.8 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -137,6 +137,12 @@ FAILURES = []
 #    Sakht chahiye to: CREATIVES_STRICT=1
 SOFT_FAILURES = []
 CREATIVES_STRICT = os.environ.get("CREATIVES_STRICT", "0") == "1"
+
+# 🛡️ v3.8 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
+#    Default 25 min. Is se run kabhi bhi creatives par nahi atkega.
+#    list isliye taake nested function bina `global` ke padh sake.
+CREATIVES_TOTAL_BUDGET = int(os.environ.get("CREATIVES_TOTAL_BUDGET", "1500"))
+_creatives_deadline    = [None]
 
 
 def record_failure(where, detail):
@@ -1573,17 +1579,45 @@ def fetch_ad_creatives_for_account(account_id):
     """
     # v3.6: 25 -> 10. Jin 2 accounts ke sab se zyada creatives hain (5,360
     #       aur 1,300) wahi toot rahe the — chhota page rate limit se bachata hai.
-    PAGE       = int(os.environ.get("CREATIVES_PAGE_SIZE", "10"))
-    PAGE_SLEEP = float(os.environ.get("CREATIVES_PAGE_SLEEP", "3"))
-    RETRIES    = int(os.environ.get("CREATIVES_RETRIES", "4"))
-    MAX_PAGES  = int(os.environ.get("CREATIVES_MAX_PAGES", "5000"))
+    # 🛡️ v3.8 — RUN #196 KA SABAQ
+    #    v3.7 mein 720s ka PER-ACCOUNT budget tha. 15 accounts × 12 min = 180 min
+    #    — theek workflow timeout jitna. Run #196 3h par CANCEL hua aur
+    #    Auction Insights / Custom Audiences / Page Insights chale hi nahi.
+    #
+    #    Ab TEEN cheezein:
+    #      1. per-account budget 720s → 180s
+    #      2. POORE PHASE ka budget (neeche _creatives_deadline)
+    #      3. page size 10 → 25
+    #
+    #    PAGE SIZE ka faisla — SIRF log ke aankdon par, andaze par nahi:
+    #      run#196: act_1852257182353427 = 1331 creatives, 134 pages, 577s
+    #               134 pages × 3s sleep = 402s  → 577s ka 70% SIRF SONE mein.
+    #      Yani PAGE=10 se pages bohot zyada ho gaye aur sleep hi bhaari para.
+    #      PAGE=25 par wahi account ~54 pages = ~81s sleep.
+    #
+    #      25 hi kyun, 50 kyun nahi?
+    #        · 25 run#193-#195 mein WAQAI chala hai
+    #        · 50 kabhi test nahi hua, aur v3.2 ke comment ke mutabiq bara page
+    #          "reduce the amount of data" (code 1) deta tha
+    #      Bina saboot ke 50 par nahi jaenge. Chahiye to CREATIVES_PAGE_SIZE=50
+    PAGE       = int(os.environ.get("CREATIVES_PAGE_SIZE", "25"))
+    PAGE_SLEEP = float(os.environ.get("CREATIVES_PAGE_SLEEP", "1.5"))
+    RETRIES    = int(os.environ.get("CREATIVES_RETRIES", "3"))
+    MAX_PAGES  = int(os.environ.get("CREATIVES_MAX_PAGES", "1000"))
     # 🛡️ BUG C KA FIX (v3.7) — har account ka WAQT KA BUDGET.
     #    Bina is ke: 8 retries × 90..600s = ~51 min PER PAGE. Do accounts
     #    fail = ~100 min extra. Pichhla run 137 min tha, YAML timeout 180 —
     #    yani GitHub run ko BEECH MEIN maar deta aur haalat pehle se KHARAB
     #    ho jati. Ab account 12 min se zyada nahi lega.
-    BUDGET     = int(os.environ.get("CREATIVES_ACCOUNT_BUDGET", "720"))
+    BUDGET     = int(os.environ.get("CREATIVES_ACCOUNT_BUDGET", "180"))
     t0         = time.time()
+
+    # 🛡️ POORE creatives phase ka deadline — sab accounts mila kar.
+    #    Ye woh guard hai jo v3.7 mein NAHI tha aur jis ki wajah se run mara.
+    if _creatives_deadline[0] is not None and time.time() > _creatives_deadline[0]:
+        log.warning(f"  Creatives: POORE PHASE ka budget khatam — {account_id} "
+                    f"chhod rahe hain (purana data mehfooz)")
+        return None
     fields = ("id,name,title,body,call_to_action_type,image_url,thumbnail_url,"
               "video_id,link_url,effective_object_story_id")
     url = f"https://graph.facebook.com/v18.0/{account_id}/adcreatives"
@@ -1591,7 +1625,12 @@ def fetch_ad_creatives_for_account(account_id):
     first_params = {"fields": fields, "limit": PAGE, "access_token": FB_ACCESS_TOKEN}
     page = 0
     while url and page < MAX_PAGES:
-        # 🛡️ BUG C: budget khatam? adhoori list NAHI — saaf nakami.
+        # 🛡️ phase ka deadline (v3.8) — kul waqt ki hadd
+        if _creatives_deadline[0] is not None and time.time() > _creatives_deadline[0]:
+            log.warning(f"  Creatives: POORE PHASE ka budget khatam ({account_id}) — "
+                        f"{len(out)} mile the, adhoori list NAHI bhejenge")
+            return None
+        # 🛡️ BUG C: is account ka budget khatam? adhoori list NAHI — saaf nakami.
         if time.time() - t0 > BUDGET:
             log.warning(f"  Creatives: {BUDGET}s ka budget khatam ({account_id}) — "
                         f"{len(out)} mile the, magar adhoori list NAHI bhejenge "
@@ -1600,11 +1639,17 @@ def fetch_ad_creatives_for_account(account_id):
         page += 1
         ok = False
         for attempt in range(RETRIES):
+            # 🛡️ v3.8b — deadline RETRY ke ANDAR bhi. Bina is ke ek page
+            #    360s backoff + 270s timeout = 630s tak deadline se BAHAR
+            #    ja sakta tha (maine pehle "25 min" kaha tha — galat, 37 tha).
+            if _creatives_deadline[0] is not None and time.time() > _creatives_deadline[0]:
+                log.warning(f"  Creatives: phase budget khatam (retry ke beech, {account_id})")
+                return None
             try:
                 resp = requests.get(
                     url,
                     params=first_params if page == 1 else {"access_token": FB_ACCESS_TOKEN},
-                    timeout=90,
+                    timeout=int(os.environ.get("CREATIVES_HTTP_TIMEOUT", "45")),
                 ).json()
                 if "error" in resp:
                     err  = resp["error"]
@@ -1614,8 +1659,16 @@ def fetch_ad_creatives_for_account(account_id):
                     if code in (1, 2, 4, 17, 32, 80000, 80004) or sub in (99, 2446079):
                         # v3.6: 60s -> 90s, aur 8 tak retries (kul ~30 min sabr)
                         wait = min(60 * (attempt + 1), 240)
+                        # 🛡️ v3.8b — backoff ko deadline/budget par KAAT do
+                        if _creatives_deadline[0] is not None:
+                            wait = min(wait, max(0, _creatives_deadline[0] - time.time()))
+                        wait = min(wait, max(0, BUDGET - (time.time() - t0)))
+                        if wait <= 0:
+                            log.warning(f"  Creatives: budget khatam, backoff nahi karenge "
+                                        f"({account_id})")
+                            return None
                         log.warning(f"  creatives page {page} — code={code}/{sub}, "
-                                    f"{wait}s wait, retry {attempt+1}/{RETRIES} ({account_id})")
+                                    f"{int(wait)}s wait, retry {attempt+1}/{RETRIES} ({account_id})")
                         time.sleep(wait)
                         continue
                     log.warning(f"  Creatives API error ({account_id}): {err}")
@@ -1627,7 +1680,12 @@ def fetch_ad_creatives_for_account(account_id):
                 break
             except Exception as e:
                 log.warning(f"  Creatives fetch error page {page} ({account_id}): {e}")
-                time.sleep(30)
+                nap = 30
+                if _creatives_deadline[0] is not None:
+                    nap = min(nap, max(0, _creatives_deadline[0] - time.time()))
+                nap = min(nap, max(0, BUDGET - (time.time() - t0)))
+                if nap > 0:
+                    time.sleep(nap)
         if not ok:
             log.warning(f"  Creatives: page {page} pe {RETRIES} retries ke baad haar gaye "
                         f"({account_id}) — {len(out)} creatives mil chuke the, "
@@ -1781,7 +1839,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.7")
+    log.info("🚀 Facebook → BigQuery sync v3.8")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1829,7 +1887,7 @@ def main():
     load_to_bq(bq, "campaigns",     fetch_campaigns(accounts))
     load_to_bq(bq, "adsets",        fetch_adsets(accounts))
     load_to_bq(bq, "ads",           fetch_ads(accounts))
-    load_to_bq(bq, "ad_creatives",  fetch_ad_creatives(accounts))
+    # 🛡️ v3.8: ad_creatives YAHAN SE HATA KAR SAB SE AAKHIR MEIN
 
     log.info("── Ad Delivery ──")
     load_to_bq(bq, "ad_delivery",   fetch_ad_delivery(accounts))
@@ -1841,6 +1899,27 @@ def main():
     load_to_bq(bq, "pixel_events",     fetch_pixel_events(accounts))
     load_to_bq(bq, "page_insights",    fetch_page_insights())
     load_to_bq(bq, "custom_audiences", fetch_custom_audiences(accounts))
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  🛡️ AD CREATIVES — SAB SE AAKHIR MEIN, WAQT KI HADD KE SAATH  (v3.8)
+    # ══════════════════════════════════════════════════════════════════════
+    #  RUN #196 (01-Sep) 3 ghante par CANCEL hua kyunki creatives beech mein
+    #  tha aur 173 minute kha gaya. Us ki wajah se Auction Insights,
+    #  Custom Audiences aur Page Insights CHALE HI NAHI.
+    #
+    #  Ab do cheezein:
+    #     · creatives SAB SE AAKHIR mein — atke bhi to kisi ka nuqsan nahi
+    #     · poore phase ka waqt ka budget — kabhi timeout nahi todega
+    #
+    #  ad_creatives sirf DIMENSION data hai (koi revenue/spend nahi) aur
+    #  guard ki wajah se purana data hamesha mehfooz rehta hai.
+    # ══════════════════════════════════════════════════════════════════════
+    log.info("── Ad Creatives (aakhir mein, %d min ki hadd) ──",
+             CREATIVES_TOTAL_BUDGET // 60)
+    _creatives_deadline[0] = time.time() + CREATIVES_TOTAL_BUDGET
+    _cr_t0 = time.time()
+    load_to_bq(bq, "ad_creatives", fetch_ad_creatives(accounts))
+    log.info("── Ad Creatives khatam: %d min mein ──", int(time.time() - _cr_t0) // 60)
 
     # ── 🛡️ BUG 6 KA FIX: exit code ab sach bolta hai ────────────────────────
     if SOFT_FAILURES:
@@ -1863,10 +1942,10 @@ def main():
         sys.exit(1)
 
     if SOFT_FAILURES:
-        log.info("✅ Facebook sync v3.7 — revenue/spend ke saarey tables theek. "
+        log.info("✅ Facebook sync v3.8 — revenue/spend ke saarey tables theek. "
                  "(%d dimension warning upar)", len(SOFT_FAILURES))
     else:
-        log.info("✅ Facebook sync v3.7 complete — 19 tables, koi masla nahi.")
+        log.info("✅ Facebook sync v3.8 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
