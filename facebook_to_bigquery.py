@@ -1,7 +1,7 @@
 """
 Facebook → BigQuery  ·  COMPLETE PIPELINE v3.8
 ===============================================
-v2.1 → v3.9 — DATA-LOSS FIXES
+v2.1 → v4.0 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -139,7 +139,7 @@ SOFT_FAILURES = []
 CREATIVES_STRICT = os.environ.get("CREATIVES_STRICT", "0") == "1"
 
 # ══════════════════════════════════════════════════════════════════════════
-#  🆕 v3.9 — GITHUB ANNOTATIONS
+#  🆕 v4.0 — GITHUB ANNOTATIONS
 #  ────────────────────────────
 #  Masla: run FAIL hone par wajah SIRF log ke andar hoti hai. GitHub ka
 #  "Annotations" box (jo page ke upar dikhta hai) usay nahi dikhata, kyunki
@@ -156,16 +156,37 @@ CREATIVES_STRICT = os.environ.get("CREATIVES_STRICT", "0") == "1"
 IN_GHA = os.environ.get("GITHUB_ACTIONS") == "true"
 
 def gha(kind: str, msg: str) -> None:
-    """GitHub Actions ke Annotations box mein likho (fail par foran nazar aaye)."""
+    """
+    GitHub Actions ke Annotations box mein likho (fail par foran nazar aaye).
+
+    🛡️ POORI TARAH TRY/EXCEPT MEIN.
+       Ye function record_failure() se call hota hai — aur record_failure
+       khud EXCEPTION HANDLERS ke andar chalta hai. Agar yahan koi cheez
+       phategi to poora run us jagah mar jayega jahan hum masla SAMBHAAL
+       rahe the. Ye sirf logging hai — kisi haal mein run nahi tor sakta.
+    """
     if not IN_GHA:
         return
-    clean = str(msg).replace("\r", " ").replace("\n", " ")[:900]
-    print(f"::{kind}::{clean}", flush=True)
+    try:
+        clean = str(msg).replace("\r", " ").replace("\n", " ")[:900]
+        print(f"::{kind}::{clean}", flush=True)
+    except Exception:
+        pass          # annotation na bane to bhi run chalta rahe
 
-# 🛡️ v3.9 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
+# 🛡️ v4.0 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
 #    Default 25 min. Is se run kabhi bhi creatives par nahi atkega.
 #    list isliye taake nested function bina `global` ke padh sake.
 CREATIVES_TOTAL_BUDGET = int(os.environ.get("CREATIVES_TOTAL_BUDGET", "1500"))
+
+# 🆕 v4.0 — code 80004 (app-level rate limit) ka window GHANTON ka hota hai.
+#    Default 300s (5 min) × attempt → 300 · 600. Run #208 mein 60/120s
+#    ki koshish bekaar gayi thi.
+INSIGHTS_RATELIMIT_WAIT = int(os.environ.get("INSIGHTS_RATELIMIT_WAIT", "300"))
+
+# 🆕 v4.0 — 1 = breakdown tables (by_placement/country/device/age) fail par
+#    bhi run RED ho. Default 0 — kyunki inka spend ad_insights_daily mein
+#    pehle se hota hai, aur fail par purana data mehfooz rehta hai.
+BREAKDOWN_STRICT = os.environ.get("BREAKDOWN_STRICT", "0") == "1"
 _creatives_deadline    = [None]
 
 
@@ -180,14 +201,43 @@ def record_failure(where, detail):
     #                                   ho chuka hota hai, table ab GALAT hai)
     #        "load[ad_creatives]"    → load job fail
     #        "delete[ad_creatives]"  → DELETE fail
-    if where.startswith("ad_creatives[") and not CREATIVES_STRICT:
+    # ══ 🔧 v4.0 (2026-09-10) — BREAKDOWN tables bhi NARM ═══════════════════
+    #  Run #208 mein `ad_insights_by_placement[1737594613510482]` rate-limit
+    #  se fail hua aur POORA run RED ho gaya (1h 47m).
+    #
+    #  Magar us account ka PAISA bilkul theek tha:
+    #     ad_insights_daily        max date 2026-09-09  ✅  ($1,513.81 Sep ka)
+    #     ad_insights_by_placement max date 2026-09-08  🟡  (ek din peeche)
+    #
+    #  Ye BREAKDOWN tables hain — inka spend `ad_insights_daily` mein PEHLE SE
+    #  aa chuka hota hai. Ye sirf batate hain ke wahi spend kis placement /
+    #  mulk / device / age par tha. Fail hone par purana data mehfooz rehta hai.
+    #
+    #  Is liye inhein bhi `ad_creatives` jaisa NARM banate hain — run RED nahi
+    #  hoga, magar Annotations box mein warning zaroor aayegi.
+    #
+    #  ⚠️ `ad_insights_daily` (asal paisa) HAMESHA SAKHT rehta hai — us par
+    #     koi narmi nahi.
+    #
+    #  Sakht chahiye to: BREAKDOWN_STRICT=1
+    # ═══════════════════════════════════════════════════════════════════════
+    _soft_prefixes = ["ad_creatives["]
+    if not BREAKDOWN_STRICT:
+        _soft_prefixes += [
+            "ad_insights_by_placement[",
+            "ad_insights_by_country[",
+            "ad_insights_by_device[",
+            "ad_insights_by_age_gender[",
+        ]
+    if any(where.startswith(px) for px in _soft_prefixes) and not (
+            where.startswith("ad_creatives[") and CREATIVES_STRICT):
         SOFT_FAILURES.append(msg)
         log.warning(f"  ⚠️  {msg}  (dimension data — run RED nahi hoga)")
         gha("warning", f"FB sync (narm): {msg}")   # 🆕 v3.9
         return
     FAILURES.append(msg)
     log.error(f"  ❌ {msg}")
-    gha("error", f"FB sync: {msg}")     # 🆕 v3.9 — Annotations box mein bhi
+    gha("error", f"FB sync: {msg}")     # 🆕 v4.0 — Annotations box mein bhi
 
 # ─── ACTION TYPES ────────────────────────────────────────────────────────────
 INSTALL_ACTIONS  = {"mobile_app_install", "app_install"}
@@ -1158,10 +1208,51 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
 
         except Exception as e:
             err_str = str(e)
-            if any(w in err_str.lower() for w in ("rate", "too many", "limit")):
-                wait = 60 * (attempt + 1)
-                log.warning(f"    Rate limit — {wait}s wait, retry {attempt+1}/3 ({acct_label})")
+
+            # ══ 🔧 v4.0 FIX (2026-09-10) — RATE LIMIT ka SAHI pata ══════════
+            #  MASLA (run #208): rate-limit ka pata SIRF string-match se lagta
+            #    tha — ("rate","too many","limit"). Facebook ka code 80004
+            #    ("Application request limit reached") ka message har baar in
+            #    lafzon par nahi girta, is liye `else` chala aur seedha
+            #    `return None` — yani EK BHI retry nahi.
+            #    Natija: ad_insights_by_placement[1737594613510482] fail,
+            #            poora run RED (1h 47m zaya).
+            #
+            #  HAL: pehle ASLI error code dekho (SDK deta hai), phir string.
+            #       Aur 80004 ka window GHANTON ka hota hai — 60/120/180s
+            #       bekaar hai. Us ke liye alag, lamba backoff.
+            # ═══════════════════════════════════════════════════════════════
+            code = sub = None
+            for attr in ("api_error_code", "api_error_subcode"):
+                try:
+                    v = getattr(e, attr, None)
+                    v = v() if callable(v) else v
+                    if attr == "api_error_code":
+                        code = v
+                    else:
+                        sub = v
+                except Exception:
+                    pass
+
+            is_rate = (
+                code in (4, 17, 32, 80000, 80004)          # FB ke rate-limit codes
+                or sub in (2446079,)
+                or any(w in err_str.lower() for w in
+                       ("rate", "too many", "limit", "reduce the amount"))
+            )
+
+            if is_rate and attempt < 2:
+                # 80004 = app-level limit, ghanton ka window → lamba wait.
+                # baqi rate-limits chhote hote hain.
+                base = INSIGHTS_RATELIMIT_WAIT if code == 80004 else 60
+                wait = base * (attempt + 1)
+                log.warning(f"    Rate limit (code={code}/{sub}) — {wait}s wait, "
+                            f"retry {attempt+1}/3 ({acct_label})")
                 time.sleep(wait)
+            elif is_rate:
+                log.warning(f"    Rate limit (code={code}/{sub}) — 3 retries ke baad "
+                            f"haar gaye ({acct_label})")
+                return None                          # 🛡️ fail — [] NAHI
             else:
                 log.warning(f"    Insights error ({acct_label}): {e}")
                 return None                          # 🛡️ fail — [] NAHI
@@ -1605,7 +1696,7 @@ def fetch_ad_creatives_for_account(account_id):
     """
     # v3.6: 25 -> 10. Jin 2 accounts ke sab se zyada creatives hain (5,360
     #       aur 1,300) wahi toot rahe the — chhota page rate limit se bachata hai.
-    # 🛡️ v3.9 — RUN #196 KA SABAQ
+    # 🛡️ v4.0 — RUN #196 KA SABAQ
     #    v3.7 mein 720s ka PER-ACCOUNT budget tha. 15 accounts × 12 min = 180 min
     #    — theek workflow timeout jitna. Run #196 3h par CANCEL hua aur
     #    Auction Insights / Custom Audiences / Page Insights chale hi nahi.
@@ -1865,7 +1956,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v3.9")
+    log.info("🚀 Facebook → BigQuery sync v4.0")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -1968,16 +2059,16 @@ def main():
         log.error("=" * 70)
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
 
-        # 🆕 v3.9 — poori wajah UPAR Annotations box mein, ek hi jagah.
+        # 🆕 v4.0 — poori wajah UPAR Annotations box mein, ek hi jagah.
         #    Ab log kholne ki zaroorat nahi — page ke upar hi dikh jayega.
         gha("error", f"FB sync FAIL — {len(FAILURES)} masle: " + " | ".join(FAILURES))
         sys.exit(1)
 
     if SOFT_FAILURES:
-        log.info("✅ Facebook sync v3.9 — revenue/spend ke saarey tables theek. "
+        log.info("✅ Facebook sync v4.0 — revenue/spend ke saarey tables theek. "
                  "(%d dimension warning upar)", len(SOFT_FAILURES))
     else:
-        log.info("✅ Facebook sync v3.9 complete — 19 tables, koi masla nahi.")
+        log.info("✅ Facebook sync v4.0 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
