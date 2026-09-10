@@ -1,7 +1,7 @@
 """
 Facebook → BigQuery  ·  COMPLETE PIPELINE v3.8
 ===============================================
-v2.1 → v4.1 — DATA-LOSS FIXES
+v2.1 → v4.2 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -139,7 +139,7 @@ SOFT_FAILURES = []
 CREATIVES_STRICT = os.environ.get("CREATIVES_STRICT", "0") == "1"
 
 # ══════════════════════════════════════════════════════════════════════════
-#  🆕 v4.1 — GITHUB ANNOTATIONS
+#  🆕 v4.2 — GITHUB ANNOTATIONS
 #  ────────────────────────────
 #  Masla: run FAIL hone par wajah SIRF log ke andar hoti hai. GitHub ka
 #  "Annotations" box (jo page ke upar dikhta hai) usay nahi dikhata, kyunki
@@ -173,17 +173,22 @@ def gha(kind: str, msg: str) -> None:
     except Exception:
         pass          # annotation na bane to bhi run chalta rahe
 
-# 🛡️ v4.1 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
+# 🛡️ v4.2 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
 #    Default 25 min. Is se run kabhi bhi creatives par nahi atkega.
 #    list isliye taake nested function bina `global` ke padh sake.
 CREATIVES_TOTAL_BUDGET = int(os.environ.get("CREATIVES_TOTAL_BUDGET", "1500"))
 
-# 🆕 v4.1 — code 80004 (app-level rate limit) ka window GHANTON ka hota hai.
+# 🆕 v4.2 — code 80004 (app-level rate limit) ka window GHANTON ka hota hai.
 #    Default 300s (5 min) × attempt → 300 · 600. Run #208 mein 60/120s
 #    ki koshish bekaar gayi thi.
 INSIGHTS_RATELIMIT_WAIT = int(os.environ.get("INSIGHTS_RATELIMIT_WAIT", "300"))
 
-# 🆕 v4.1 — 1 = breakdown tables (by_placement/country/device/age) fail par
+# 🆕 v4.2 — Facebook ka async job "Job Failed" de de to kitni der baad dobara
+#    koshish karein. Ye aksar AARZI hota hai (rate-limit window ke baad, ya
+#    FB ke andar ka masla). 45s × attempt → 45 · 90.
+ASYNC_RETRY_WAIT = int(os.environ.get("ASYNC_RETRY_WAIT", "45"))
+
+# 🆕 v4.2 — 1 = breakdown tables (by_placement/country/device/age) fail par
 #    bhi run RED ho. Default 0 — kyunki inka spend ad_insights_daily mein
 #    pehle se hota hai, aur fail par purana data mehfooz rehta hai.
 BREAKDOWN_STRICT = os.environ.get("BREAKDOWN_STRICT", "0") == "1"
@@ -237,7 +242,7 @@ def record_failure(where, detail):
         return
     FAILURES.append(msg)
     log.error(f"  ❌ {msg}")
-    gha("error", f"FB sync: {msg}")     # 🆕 v4.1 — Annotations box mein bhi
+    gha("error", f"FB sync: {msg}")     # 🆕 v4.2 — Annotations box mein bhi
 
 # ─── ACTION TYPES ────────────────────────────────────────────────────────────
 INSTALL_ACTIONS  = {"mobile_app_install", "app_install"}
@@ -952,7 +957,7 @@ RATE_LIMIT_CODES    = {4, 17, 32, 80000, 80004}
 RATE_LIMIT_SUBCODES = {2446079}
 
 # ══════════════════════════════════════════════════════════════════════════
-#  🆕 v4.1 — RATE LIMIT ka SAHI ilaaj  (run #210 ka sabaq)
+#  🆕 v4.2 — RATE LIMIT ka SAHI ilaaj  (run #210 ka sabaq)
 #  ─────────────────────────────────────────────────────
 #  Run #210 discovery par hi mar gaya:
 #     owned_ad_accounts  code=80004/2446079  →  30·60·90·120s  →  bamushkil chala
@@ -1116,7 +1121,7 @@ def _fetch_account_page(url, params, label="account_page"):
                            ("rate", "too many", "reduce the amount", "temporarily", "try again"))
                 )
                 if is_transient and attempt < DISCOVERY_RETRIES - 1:
-                    # 🆕 v4.1 — Facebook ke APNE headers se wait nikaalo
+                    # 🆕 v4.2 — Facebook ke APNE headers se wait nikaalo
                     usage = _fb_usage(r)
                     wait  = _ratelimit_wait(usage, code, sub, attempt)
                     # 🛡️ wait ko phase ke deadline par KAAT do — us se aage
@@ -1143,7 +1148,7 @@ def _fetch_account_page(url, params, label="account_page"):
             if r.status_code >= 400:
                 raise RuntimeError(f"HTTP {r.status_code} bina error body: {r.text[:300]}")
 
-            # 🆕 v4.1 — kaamyab call ke baad bhi usage dekho; zaroorat ho to ruk jao
+            # 🆕 v4.2 — kaamyab call ke baad bhi usage dekho; zaroorat ho to ruk jao
             _throttle(_fb_usage(r), label)
             return body
 
@@ -1309,13 +1314,32 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
             waited = 0
             last_pct = -1
             stall = 0
+            job_failed = None          # 🆕 v4.2 — "Job Failed" ka nishan
             while True:
                 status = async_job[AdReportRun.Field.async_status]
                 if status == "Job Completed":
                     break
                 if status in ("Job Failed", "Job Skipped"):
-                    log.warning(f"    Async job {status} ({acct_label})")
-                    return None                      # 🛡️ fail — [] NAHI
+                    # ══ 🔧 v4.2 FIX (2026-09-10) — run #211 ka sabaq ═════════
+                    #  PEHLE: yahan seedha `return None` tha — chahe hum
+                    #         `for attempt in range(3)` ke ANDAR hi kyun na hon.
+                    #         Yani "Job Failed" par EK BHI retry nahi hoti thi.
+                    #
+                    #  Run #211: adset_daily_insights[3432297843590807]
+                    #            "Job Failed (0%)" — 10 second mein, foran.
+                    #            Ye AARZI hota hai (khaaskar rate-limit window
+                    #            ke foran baad). Ek retry se aksar chal jata.
+                    #
+                    #  AB: nishan laga kar while se nikalte hain, phir bahar
+                    #      `continue` se agli attempt. Teen attempt ke baad hi
+                    #      haar maante hain.
+                    #
+                    #  ⚠️ `break` seedha nahi kar sakte — neeche get_result()
+                    #     chalega aur fail hui job par crash karega. Is liye
+                    #     nishan (job_failed) chahiye.
+                    # ═════════════════════════════════════════════════════════
+                    job_failed = status
+                    break
 
                 if waited >= MAX_POLL_SECONDS:
                     log.warning(f"    ⏱️  Timeout {MAX_POLL_SECONDS}s pe "
@@ -1336,6 +1360,18 @@ def get_insights_async(account, level, breakdowns=None, extra_fields=None, param
                     stall += 1
                     if stall % 6 == 0:
                         log.info(f"    ...abhi bhi {pct}% pe ({waited}s / {MAX_POLL_SECONDS}s)")
+
+            # 🆕 v4.2 — job fail hui thi? phir agli attempt par jao
+            if job_failed:
+                if attempt < 2:
+                    wait = ASYNC_RETRY_WAIT * (attempt + 1)
+                    log.warning(f"    Async job {job_failed} ({acct_label}) — "
+                                f"{wait}s wait, retry {attempt+1}/3")
+                    time.sleep(wait)
+                    continue
+                log.warning(f"    Async job {job_failed} — 3 attempts ke baad "
+                            f"haar gaye ({acct_label})")
+                return None                          # 🛡️ fail — [] NAHI
 
             results = []
             cursor = async_job.get_result(params={"limit": 500})
@@ -1834,7 +1870,7 @@ def fetch_ad_creatives_for_account(account_id):
     """
     # v3.6: 25 -> 10. Jin 2 accounts ke sab se zyada creatives hain (5,360
     #       aur 1,300) wahi toot rahe the — chhota page rate limit se bachata hai.
-    # 🛡️ v4.1 — RUN #196 KA SABAQ
+    # 🛡️ v4.2 — RUN #196 KA SABAQ
     #    v3.7 mein 720s ka PER-ACCOUNT budget tha. 15 accounts × 12 min = 180 min
     #    — theek workflow timeout jitna. Run #196 3h par CANCEL hua aur
     #    Auction Insights / Custom Audiences / Page Insights chale hi nahi.
@@ -2094,7 +2130,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v4.1")
+    log.info("🚀 Facebook → BigQuery sync v4.2")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -2197,16 +2233,16 @@ def main():
         log.error("=" * 70)
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
 
-        # 🆕 v4.1 — poori wajah UPAR Annotations box mein, ek hi jagah.
+        # 🆕 v4.2 — poori wajah UPAR Annotations box mein, ek hi jagah.
         #    Ab log kholne ki zaroorat nahi — page ke upar hi dikh jayega.
         gha("error", f"FB sync FAIL — {len(FAILURES)} masle: " + " | ".join(FAILURES))
         sys.exit(1)
 
     if SOFT_FAILURES:
-        log.info("✅ Facebook sync v4.1 — revenue/spend ke saarey tables theek. "
+        log.info("✅ Facebook sync v4.2 — revenue/spend ke saarey tables theek. "
                  "(%d dimension warning upar)", len(SOFT_FAILURES))
     else:
-        log.info("✅ Facebook sync v4.1 complete — 19 tables, koi masla nahi.")
+        log.info("✅ Facebook sync v4.2 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
