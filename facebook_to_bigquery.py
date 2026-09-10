@@ -1,7 +1,7 @@
 """
 Facebook → BigQuery  ·  COMPLETE PIPELINE v3.8
 ===============================================
-v2.1 → v4.0 — DATA-LOSS FIXES
+v2.1 → v4.1 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -139,7 +139,7 @@ SOFT_FAILURES = []
 CREATIVES_STRICT = os.environ.get("CREATIVES_STRICT", "0") == "1"
 
 # ══════════════════════════════════════════════════════════════════════════
-#  🆕 v4.0 — GITHUB ANNOTATIONS
+#  🆕 v4.1 — GITHUB ANNOTATIONS
 #  ────────────────────────────
 #  Masla: run FAIL hone par wajah SIRF log ke andar hoti hai. GitHub ka
 #  "Annotations" box (jo page ke upar dikhta hai) usay nahi dikhata, kyunki
@@ -173,17 +173,17 @@ def gha(kind: str, msg: str) -> None:
     except Exception:
         pass          # annotation na bane to bhi run chalta rahe
 
-# 🛡️ v4.0 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
+# 🛡️ v4.1 — creatives POORE PHASE ka waqt ka budget (sab accounts mila kar).
 #    Default 25 min. Is se run kabhi bhi creatives par nahi atkega.
 #    list isliye taake nested function bina `global` ke padh sake.
 CREATIVES_TOTAL_BUDGET = int(os.environ.get("CREATIVES_TOTAL_BUDGET", "1500"))
 
-# 🆕 v4.0 — code 80004 (app-level rate limit) ka window GHANTON ka hota hai.
+# 🆕 v4.1 — code 80004 (app-level rate limit) ka window GHANTON ka hota hai.
 #    Default 300s (5 min) × attempt → 300 · 600. Run #208 mein 60/120s
 #    ki koshish bekaar gayi thi.
 INSIGHTS_RATELIMIT_WAIT = int(os.environ.get("INSIGHTS_RATELIMIT_WAIT", "300"))
 
-# 🆕 v4.0 — 1 = breakdown tables (by_placement/country/device/age) fail par
+# 🆕 v4.1 — 1 = breakdown tables (by_placement/country/device/age) fail par
 #    bhi run RED ho. Default 0 — kyunki inka spend ad_insights_daily mein
 #    pehle se hota hai, aur fail par purana data mehfooz rehta hai.
 BREAKDOWN_STRICT = os.environ.get("BREAKDOWN_STRICT", "0") == "1"
@@ -237,7 +237,7 @@ def record_failure(where, detail):
         return
     FAILURES.append(msg)
     log.error(f"  ❌ {msg}")
-    gha("error", f"FB sync: {msg}")     # 🆕 v4.0 — Annotations box mein bhi
+    gha("error", f"FB sync: {msg}")     # 🆕 v4.1 — Annotations box mein bhi
 
 # ─── ACTION TYPES ────────────────────────────────────────────────────────────
 INSTALL_ACTIONS  = {"mobile_app_install", "app_install"}
@@ -947,6 +947,119 @@ ALL_DISCOVERED_ACCOUNTS = set()   # normalized ids — TRUNCATE guard iske saath
 TRANSIENT_CODES    = {1, 2, 4, 17, 32, 341, 613, 80000, 80004}
 TRANSIENT_SUBCODES = {99, 2446079}
 
+# 🆕 wo codes jo ASAL rate-limit hain (inka window MINUTON/GHANTON ka hota hai)
+RATE_LIMIT_CODES    = {4, 17, 32, 80000, 80004}
+RATE_LIMIT_SUBCODES = {2446079}
+
+# ══════════════════════════════════════════════════════════════════════════
+#  🆕 v4.1 — RATE LIMIT ka SAHI ilaaj  (run #210 ka sabaq)
+#  ─────────────────────────────────────────────────────
+#  Run #210 discovery par hi mar gaya:
+#     owned_ad_accounts  code=80004/2446079  →  30·60·90·120s  →  bamushkil chala
+#     client_ad_accounts code=80004/2446079  →  30·60s ...     →  5 retry khatam
+#     poora run 10 min mein RED.
+#
+#  MASLA: 80004 = "There have been too many calls to this ad-account".
+#         Us ka window MINUTON ka hota hai — 30/60/90/120s ki koshish
+#         sirf aag mein tel daalti hai (har retry bhi ek call hai).
+#
+#  HAL: Facebook KHUD batata hai kitni der rukna hai — response headers mein:
+#       · X-Business-Use-Case-Usage → estimated_time_to_regain_access (MINUTES)
+#       · X-Ad-Account-Usage        → acc_id_util_pct
+#       · X-App-Usage               → call_count / total_cputime / total_time
+#       Hum ye padhte hi nahi the. Ab padhte hain aur UTNA hi rukte hain.
+#
+#  Aur PEHLE SE bachte hain: agar usage THROTTLE_PCT se upar chala jaye to
+#  har call ke baad thoda ruk jate hain — deewar se takrane se pehle.
+# ══════════════════════════════════════════════════════════════════════════
+RATELIMIT_BASE_WAIT = int(os.environ.get("RATELIMIT_BASE_WAIT", "180"))   # 80004 ka base
+RATELIMIT_MAX_WAIT  = int(os.environ.get("RATELIMIT_MAX_WAIT",  "900"))   # HAMARI guess ki hadd
+# 🔑 jab FACEBOOK khud kehta hai kitni der rukna hai, us par kushada hadd —
+#    wo andaza hamare andaze se kaheen behtar hai. 30 min tak maan lete hain.
+FB_REGAIN_MAX_WAIT  = int(os.environ.get("FB_REGAIN_MAX_WAIT", "1800"))
+THROTTLE_PCT        = float(os.environ.get("THROTTLE_PCT",       "80"))   # is se upar → susti
+THROTTLE_SLEEP      = float(os.environ.get("THROTTLE_SLEEP",      "3"))   # kitni susti
+
+# 🆕 discovery ka fail hona = POORA run mar jata hai (aage kuch nahi chalta).
+#    Is liye yahan retries zyada. 8 attempts × smart backoff se ~70 min tak
+#    intezaar ho sakta hai — run ka timeout 240 min hai, gunjaish kaafi hai.
+DISCOVERY_RETRIES   = int(os.environ.get("DISCOVERY_RETRIES", "8"))
+
+# 🛡️ v4.1b — POORE DISCOVERY PHASE KA WAQT KA BUDGET
+#    Bina is ke: agar FB har retry par "30 min ruko" kahe, to
+#       7 retry × 1800s = 210 min   (sirf EK call par)
+#       aur discovery ke DO call hain (owned + client) → 420 min
+#    → workflow ka 240-min timeout tootega aur run BEECH MEIN CANCEL hoga
+#      (bilkul run #196 jaisa). Ye wahi ghalti hai jo creatives mein hui thi:
+#      per-attempt hadd thi, POORE PHASE ki nahi.
+#    Ab poore discovery (dono call mila kar) ka ek budget hai.
+DISCOVERY_TOTAL_BUDGET = int(os.environ.get("DISCOVERY_TOTAL_BUDGET", "3600"))  # 60 min
+_discovery_deadline    = [None]
+
+
+def _fb_usage(resp) -> dict:
+    """
+    Facebook ke rate-limit headers padho.
+
+    returns {"pct": 0-100 (sab se zyada), "regain_min": minute}
+
+    🛡️ POORA try/except — header na ho ya kharab ho to bhi run na ruke.
+    """
+    out = {"pct": 0.0, "regain_min": 0}
+    try:
+        h = getattr(resp, "headers", {}) or {}
+
+        raw = h.get("X-Business-Use-Case-Usage")
+        if raw:
+            for _biz, entries in json.loads(raw).items():
+                for e in (entries or []):
+                    for k in ("call_count", "total_cputime", "total_time"):
+                        out["pct"] = max(out["pct"], float(e.get(k, 0) or 0))
+                    out["regain_min"] = max(
+                        out["regain_min"],
+                        int(e.get("estimated_time_to_regain_access", 0) or 0))
+
+        raw = h.get("X-Ad-Account-Usage")
+        if raw:
+            d = json.loads(raw)
+            out["pct"] = max(out["pct"], float(d.get("acc_id_util_pct", 0) or 0))
+
+        raw = h.get("X-App-Usage")
+        if raw:
+            d = json.loads(raw)
+            for k in ("call_count", "total_cputime", "total_time"):
+                out["pct"] = max(out["pct"], float(d.get(k, 0) or 0))
+    except Exception:
+        pass
+    return out
+
+
+def _ratelimit_wait(usage: dict, code, sub, attempt: int) -> int:
+    """
+    Kitni der rukna hai — TARTEEB:
+      1. Facebook ka apna estimated_time_to_regain_access (sab se bharosemand)
+      2. asal rate-limit code (80004 waghera) → lamba backoff
+      3. baqi aarzi errors → chhota backoff
+    """
+    if usage.get("regain_min", 0) > 0:
+        # 🔑 Facebook ka apna andaza SAB SE BHAROSEMAND hai — us par HAMARI
+        #    guess wali hadd (RATELIMIT_MAX_WAIT) mat lagao. Agar FB kehta hai
+        #    "18 min" aur hum 15 min baad hi try karein, to phir wahi fail.
+        #    Is ke liye alag, kushada hadd (FB_REGAIN_MAX_WAIT = 30 min).
+        return min(usage["regain_min"] * 60 + 15, FB_REGAIN_MAX_WAIT)
+    if code in RATE_LIMIT_CODES or sub in RATE_LIMIT_SUBCODES:
+        return min(RATELIMIT_BASE_WAIT * (attempt + 1), RATELIMIT_MAX_WAIT)
+    return min(30 * (attempt + 1), RATELIMIT_MAX_WAIT)
+
+
+def _throttle(usage: dict, label: str = "") -> None:
+    """Deewar se takrane se PEHLE thoda ruk jao."""
+    pct = usage.get("pct", 0)
+    if pct >= THROTTLE_PCT:
+        nap = THROTTLE_SLEEP * (1 + (pct - THROTTLE_PCT) / 10.0)
+        log.info(f"    ⏳ usage {pct:.0f}% — {nap:.1f}s susti {label}")
+        time.sleep(nap)
+
 
 def _fetch_account_page(url, params, label="account_page"):
     """
@@ -971,7 +1084,17 @@ def _fetch_account_page(url, params, label="account_page"):
          · sirf asli (permanent) error pe raise
     """
     last_err = None
-    for attempt in range(5):
+
+    # 🛡️ v4.1b — poore discovery phase ka deadline (pehli call par set hota hai)
+    if _discovery_deadline[0] is None:
+        _discovery_deadline[0] = time.time() + DISCOVERY_TOTAL_BUDGET
+
+    for attempt in range(DISCOVERY_RETRIES):
+        # 🛡️ budget khatam? aage koshish bekaar — saaf nakami do
+        if time.time() > _discovery_deadline[0]:
+            raise RuntimeError(
+                f"{label}: discovery ka {DISCOVERY_TOTAL_BUDGET//60}-min budget khatam "
+                f"(Facebook rate-limit khul hi nahi raha) — {last_err}")
         try:
             r = requests.get(url, params=params, timeout=60)
 
@@ -992,10 +1115,22 @@ def _fetch_account_page(url, params, label="account_page"):
                     or any(w in message.lower() for w in
                            ("rate", "too many", "reduce the amount", "temporarily", "try again"))
                 )
-                if is_transient and attempt < 4:
-                    wait = 30 * (attempt + 1)
+                if is_transient and attempt < DISCOVERY_RETRIES - 1:
+                    # 🆕 v4.1 — Facebook ke APNE headers se wait nikaalo
+                    usage = _fb_usage(r)
+                    wait  = _ratelimit_wait(usage, code, sub, attempt)
+                    # 🛡️ wait ko phase ke deadline par KAAT do — us se aage
+                    #    sona bekaar hai, workflow ka timeout toot jayega
+                    wait  = int(min(wait, max(0, _discovery_deadline[0] - time.time())))
+                    if wait <= 0:
+                        raise RuntimeError(
+                            f"{label}: discovery budget khatam — code={code}/{sub}: "
+                            f"{message[:200]}")
+                    extra = (f"  ·  FB: {usage['regain_min']} min mein khulega"
+                             if usage.get("regain_min")
+                             else f"  ·  usage {usage['pct']:.0f}%")
                     log.warning(f"  {label}: aarzi error code={code}/{sub} — "
-                                f"{wait}s wait, retry {attempt+1}/5")
+                                f"{wait}s wait, retry {attempt+1}/{DISCOVERY_RETRIES}{extra}")
                     log.warning(f"    FB message: {message[:200]}")
                     time.sleep(wait)
                     last_err = RuntimeError(f"code={code} sub={sub}: {message[:200]}")
@@ -1008,21 +1143,24 @@ def _fetch_account_page(url, params, label="account_page"):
             if r.status_code >= 400:
                 raise RuntimeError(f"HTTP {r.status_code} bina error body: {r.text[:300]}")
 
+            # 🆕 v4.1 — kaamyab call ke baad bhi usage dekho; zaroorat ho to ruk jao
+            _throttle(_fb_usage(r), label)
             return body
 
         except RuntimeError:
             raise
         except Exception as e:
             # network / timeout — ye bhi aarzi hai
-            if attempt < 4:
-                wait = 30 * (attempt + 1)
-                log.warning(f"  {label}: network error — {wait}s wait, retry {attempt+1}/5: {e}")
+            if attempt < DISCOVERY_RETRIES - 1:
+                wait = min(30 * (attempt + 1), RATELIMIT_MAX_WAIT)
+                log.warning(f"  {label}: network error — {wait}s wait, "
+                            f"retry {attempt+1}/{DISCOVERY_RETRIES}: {e}")
                 time.sleep(wait)
                 last_err = e
                 continue
             raise
 
-    raise RuntimeError(f"{label}: 5 retries ke baad haar gaye — {last_err}")
+    raise RuntimeError(f"{label}: {DISCOVERY_RETRIES} retries ke baad haar gaye — {last_err}")
 
 
 def _collect_accounts(edge):
@@ -1696,7 +1834,7 @@ def fetch_ad_creatives_for_account(account_id):
     """
     # v3.6: 25 -> 10. Jin 2 accounts ke sab se zyada creatives hain (5,360
     #       aur 1,300) wahi toot rahe the — chhota page rate limit se bachata hai.
-    # 🛡️ v4.0 — RUN #196 KA SABAQ
+    # 🛡️ v4.1 — RUN #196 KA SABAQ
     #    v3.7 mein 720s ka PER-ACCOUNT budget tha. 15 accounts × 12 min = 180 min
     #    — theek workflow timeout jitna. Run #196 3h par CANCEL hua aur
     #    Auction Insights / Custom Audiences / Page Insights chale hi nahi.
@@ -1956,7 +2094,7 @@ def fetch_page_insights():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Facebook → BigQuery sync v4.0")
+    log.info("🚀 Facebook → BigQuery sync v4.1")
     log.info(f"   Lookback: {LOOKBACK_DAYS}d | Business: {FB_BUSINESS_ID}")
     log.info(f"   MAX_POLL={MAX_POLL_SECONDS}s | ACTIVE_ONLY={ACTIVE_ONLY} | "
              f"ALLOW_TRUNCATE={ALLOW_TRUNCATE} | DRY_RUN={DRY_RUN}")
@@ -2059,16 +2197,16 @@ def main():
         log.error("=" * 70)
         log.error("Jin accounts ka fetch fail hua, unka purana data CHHUA NAHI gaya.")
 
-        # 🆕 v4.0 — poori wajah UPAR Annotations box mein, ek hi jagah.
+        # 🆕 v4.1 — poori wajah UPAR Annotations box mein, ek hi jagah.
         #    Ab log kholne ki zaroorat nahi — page ke upar hi dikh jayega.
         gha("error", f"FB sync FAIL — {len(FAILURES)} masle: " + " | ".join(FAILURES))
         sys.exit(1)
 
     if SOFT_FAILURES:
-        log.info("✅ Facebook sync v4.0 — revenue/spend ke saarey tables theek. "
+        log.info("✅ Facebook sync v4.1 — revenue/spend ke saarey tables theek. "
                  "(%d dimension warning upar)", len(SOFT_FAILURES))
     else:
-        log.info("✅ Facebook sync v4.0 complete — 19 tables, koi masla nahi.")
+        log.info("✅ Facebook sync v4.1 complete — 19 tables, koi masla nahi.")
 
 
 if __name__ == "__main__":
