@@ -1,7 +1,7 @@
 """
 Facebook → BigQuery  ·  COMPLETE PIPELINE v3.8
 ===============================================
-v2.1 → v4.2 — DATA-LOSS FIXES
+v2.1 → v4.3 — DATA-LOSS FIXES
 
 ──────────────────────────────────────────────────────────────────────────────
 JO HUA (2026-08-27, saabit shuda)
@@ -246,6 +246,11 @@ def record_failure(where, detail):
 
 # ─── ACTION TYPES ────────────────────────────────────────────────────────────
 INSTALL_ACTIONS  = {"mobile_app_install", "app_install"}
+# 🆕 v4.3 — iOS 14.5+ (ATT) ke baad Facebook iOS installs SKAdNetwork se deta hai;
+#    wo `omni_app_install` mein aate hain, `mobile_app_install` mein NAHI.
+#    ALAG column mein rakhte hain — jama NAHI, kyunki Android par dono aate hain
+#    aur extract_actions() sum karta hai (double-count ho jata).
+OMNI_INSTALL_ACTIONS = {"omni_app_install"}
 PURCHASE_ACTIONS = {"offsite_conversion.fb_pixel_purchase", "purchase", "omni_purchase"}
 LEAD_ACTIONS     = {"lead", "offsite_conversion.fb_pixel_lead"}
 ROAS_ACTIONS     = {"omni_purchase", "offsite_conversion.fb_pixel_purchase", "purchase"}
@@ -311,6 +316,7 @@ def kpi_fields():
         bigquery.SchemaField("unique_clicks",         "INTEGER"),
         bigquery.SchemaField("unique_ctr",            "FLOAT"),
         bigquery.SchemaField("mobile_app_installs",   "INTEGER"),
+        bigquery.SchemaField("omni_app_installs",     "INTEGER"),   # 🆕 v4.3 iOS SKAN
         bigquery.SchemaField("cost_per_install",      "FLOAT"),
         bigquery.SchemaField("purchases",             "INTEGER"),
         bigquery.SchemaField("purchase_value",        "FLOAT"),
@@ -689,8 +695,9 @@ def extract_video(insight, field):
     return None
 
 def build_kpi(insight):
-    installs  = extract_actions(insight, INSTALL_ACTIONS)
-    purchases = extract_actions(insight, PURCHASE_ACTIONS)
+    installs      = extract_actions(insight, INSTALL_ACTIONS)
+    omni_installs = extract_actions(insight, OMNI_INSTALL_ACTIONS)   # 🆕 v4.3
+    purchases     = extract_actions(insight, PURCHASE_ACTIONS)
     purch_val = extract_action_values(insight, ROAS_ACTIONS)
     spend     = safe_float(insight.get("spend")) or 0.0
 
@@ -716,6 +723,7 @@ def build_kpi(insight):
         "unique_clicks":            safe_int(insight.get("unique_clicks")),
         "unique_ctr":               safe_float(insight.get("unique_ctr")),
         "mobile_app_installs":      installs,
+        "omni_app_installs":        omni_installs,                    # 🆕 v4.3
         "cost_per_install":         round(spend / installs, 4) if installs else None,
         "purchases":                purchases,
         "purchase_value":           purch_val,
@@ -808,6 +816,10 @@ def _load_job(client, table_ref, rows, name, write_disposition):
         schema=SCHEMAS[name],
         write_disposition=write_disposition,
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        # 🆕 v4.3 — schema mein naya column aaye to table par khud jud jaye.
+        #    Is ke baghair `omni_app_installs` par "schema mismatch" aata.
+        #    Sirf JODTA hai — kabhi kuch hataata ya badalta nahi.
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
     job = client.load_table_from_json(rows, table_ref, job_config=job_config)
     job.result()                      # error pe raise karta hai
