@@ -816,11 +816,16 @@ def _load_job(client, table_ref, rows, name, write_disposition):
         schema=SCHEMAS[name],
         write_disposition=write_disposition,
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        # 🆕 v4.3 — schema mein naya column aaye to table par khud jud jaye.
-        #    Is ke baghair `omni_app_installs` par "schema mismatch" aata.
-        #    Sirf JODTA hai — kabhi kuch hataata ya badalta nahi.
-        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
+    # 🆕 v4.3 — schema mein naya column aaye to table par khud jud jaye
+    #    (`omni_app_installs`). SIRF WRITE_APPEND par — BigQuery WRITE_TRUNCATE
+    #    ke saath ye option non-partitioned table par reject karta hai
+    #    (adsets/ads yehi use karte hain). TRUNCATE mein waise bhi poora schema
+    #    dobara likha jata hai, is liye wahan zaroorat hi nahi.
+    if write_disposition == bigquery.WriteDisposition.WRITE_APPEND:
+        job_config.schema_update_options = [
+            bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION
+        ]
     job = client.load_table_from_json(rows, table_ref, job_config=job_config)
     job.result()                      # error pe raise karta hai
     return job.output_rows
